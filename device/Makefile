@@ -1,0 +1,16 @@
+obj-$(CONFIG_CSI_OV7670) 					+= ov7670.o
+obj-$(CONFIG_CSI_GT2005)					+= gt2005.o
+obj-$(CONFIG_CSI_GC0308)					+= gc0308.o
+#obj-$(CONFIG_CSI_HI704)						+= hi704.o
+# obj-$(CONFIG_CSI_SP0838)					+= sp0838.o 
+#obj-$(CONFIG_CSI_MT9M112)					+= mt9m112.o
+#obj-$(CONFIG_CSI_MT9M113)					+= mt9m113.o
+#obj-$(CONFIG_CSI_OV2655)					+= ov2655.o
+#obj-$(CONFIG_CSI_HI253)						+= hi253.o
+#obj-$(CONFIG_CSI_MT9D112)					+= mt9d112.o
+#obj-$(CONFIG_CSI_GC0307)					+= gc0307.o
+obj-$(CONFIG_CSI_OV5640)					+= ov5640.o
+#obj-$(CONFIG_CSI_OV5641)					+= ov5641.o
+#obj-$(CONFIG_CSI_OV5642)					+= ov5642.o
+#obj-$(CONFIG_CSI_OV5643)					+= ov5643.o
+#obj-$(CONFIG_CSI_OV5644)					+= ov5644.o
