@@ -1,5 +1,9 @@
+
 /** A V4L2 driver for ov5640 camera modules.
- Intro:
+
++++ this is the same as ov5640.c but with extra feature to set framerates +++
+
+ Intro: 
  This driver talks to the camera via the i2c bus. (to set/get camera parameters)
  It also talks to the gpio-pin_io-module for IO-lines for Reset/Standby/etc, the powermodule to set sensor_power,
  and CSI_clock_module to set the camera-clock.
@@ -14,19 +18,19 @@
  The data then passes through the CSI module.
 
  The CSI Module:
- Data is captured into a fifo-buffer. Its format can be RAW(any Camera format) or YUV422(default).
+ Data is captured into a fifo-buffer. Its format can be RAW(any Camera format) or YUV422(to be optionally converted by CSI).
  Data can be optionally converted before it leaves the CSI_module out to the memory.
  Possible output conversions are:
- PassThrough = no conversion. mostly used. Input must be set to RAW!
- When input is set to YUV422(default), the following conversions are possible:
+ PassThrough = no conversion. mostly used. CSI-Input must be set to RAW!
+ When CSI-input is set to YUV422(default), the following conversions are possible:
  - planar YUV422P (default)
  - planar YUV420P
  - planar YUV422 UV combined
  - planar YUV420 UV combined
- - tiled YUV422 (crobbed)
+ - tiled YUV422 (crobbed from the input)
  - tiled YUV420
 
- Data is then transferred to the memory via CSI-internal DMA, and an Interrupt is generated at the end of a full frame dma-transfer.
+ Data is then transferred to the memory via special CSI-internal DMA, and an Interrupt is generated at the end of a full frame dma-transfer.
  For this, the fifos need a destination memory address (buffer) to place the data of the frame. (This is not a kernel DMA!)
  Double buffering is possible which uses alternating fifos/buffers. (read while other is written to!)
 
@@ -49,7 +53,7 @@
  * @xfer_func:  transfer function of the data (from enum v4l2_xfer_func)
 
  Common Frame Sizes and Framerates:
-  at 24MHZ input clock, the outputted pixelclock is fe. 48MHZ, thus pumping out 48-million Bytes per second.!!
+  at 24MHZ input clock to the camera, the outputted pixelclock is fe. 48MHZ, thus pumping out 48-million Bytes per second.!!
   At two Bytes per Pixel, we can pump out 24 million pixel per second.
   Format      Framesize/Pixel   Framerate  (24-million / Framesize*2 = Frames per Second)
   =====================================
@@ -73,7 +77,11 @@ Bayer RAW10(it bypasses the internal format controler)
  D0-D7 = parallel dataport
  HREF = horizontal sync (one pulse per line)
  VREF = vertical/picture sync (one pulse per frame)
+ XVCLK = 24MHZ input clock from CSI to camera.
+ control-pins for RESET,STANDBY
 
+ For supported camera control settings, see function "sensor_queryctrl".
+ 
  July 7, 2017, Thomas Krueger
  */
 
@@ -94,7 +102,7 @@ Bayer RAW10(it bypasses the internal format controler)
 #include "../include/sun4i_csi_core.h"
 #include "../include/sun4i_dev_csi.h"
 
-MODULE_AUTHOR("Thomas Krueger, Hofgeismar, Germany");
+MODULE_AUTHOR("Thomas Krueger, Germany");
 MODULE_DESCRIPTION("V4L2-Sub_Device Driver for the OV5640 CAM Module");
 MODULE_LICENSE("GPL");
 
@@ -156,35 +164,35 @@ struct csi_signal_config ccm_info_con =
 };
 
 
-/** our special camera settings struct
-As we are usnig the camera struct from the csi driver, we only save active control settings here.
+/** our special camera settings struct. This is allocated at probe.
+As we are using the camera struct from the csi driver, we only save active camera settings here .
+controls are stored in global Control-struct.
 */
 struct sensor_info
 {
-    struct v4l2_subdev sd;  // subdev device handle
-    struct sensor_format_struct *fmt;  // Current format
-    struct csi_signal_config *csi_sig_cfg;
-    // picture dimensions
-    int	width; 		//in pixel
-    int	height;		// in pixel
-    //picture options
-    int brightness;
-    int	contrast;
-    int saturation;
-    int hue;
-    int hflip;
-    int vflip;
-    int gain;
-    int autogain;
-    int exp;
-    enum v4l2_exposure_auto_type autoexp;
-    int autowb;
-    enum v4l2_whiteblance wb;
-    enum v4l2_colorfx clrfx;
-    enum v4l2_flash_mode flash_mode;
-// fps stuff
-	int fps;
+    struct v4l2_subdev sd;  // subdev device handle of i2c
+    struct sensor_format_struct *fmt;  // Current video format
+    struct csi_signal_config *csi_sig_cfg; // this cameras port signal config
+    // current picture dimensions
+    unsigned short	width; 		//in pixel
+    unsigned short	height;		// in pixel
+	unsigned short min_fps;
+	unsigned short def_fps;
+	unsigned short max_fps;
+
+// current fps and pixelclock
+unsigned short vts;
+unsigned short hts;
+	unsigned short fps;
 	ulong pxclk;
+	
+// current control settings	
+    unsigned char hflip;	//0=off; 1=on
+    unsigned char vflip;	//0=off; 1=on
+    unsigned char pattern; // testpattern selection
+    unsigned char gain;  //gainvalue 
+    unsigned char autoexp; //nightmode on/off
+	
 };
 
 // get address of info sruct from the subdev handle
@@ -193,17 +201,7 @@ static inline struct sensor_info *to_state(struct v4l2_subdev *sd)
     return container_of(sd, struct sensor_info, sd);
 }
 
-// active control settings
-struct sensor_control
-{
-    unsigned char autogain;
-    unsigned char gain;
-    unsigned char color;
-    unsigned char pattern;
-    unsigned char autoexp;
-    unsigned char hflip;	//0=off; 1=on
-    unsigned char vflip;	//0=off; 1=on
-} control;
+
 
 // i2c subdev handle for gloabl usage. (yes, thats bad!)
 struct v4l2_subdev *i2cdev;
@@ -222,7 +220,7 @@ struct regval_list
 Note, some registers are undocumented and taken AS IS from example code supplied by omnivision.
 */
 // subsampling from 2592x1932, binning 2x2, scaling to 640x480
-static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, subsample On, Scaling On
+static struct regval_list regs_init_VGA[] =  //default: VGA 640x480, 4:3, 15fps, subsample On, Scaling On
 {
     {{0x30,0x08},{0x42}},	//stop streaming during register setting
 //***** HW settings	
@@ -250,7 +248,7 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
 	
     {{0x50,0x00},{0xa7}}, //optimisation enables, lenc[7],gamma[5],bpc[2],  wpc[1],cip[0]
 	// CIP to get color, gamma to get brightness).
-//Scaling enable!!	
+//Scaling enable!!	0xa7=on, 0x87=off
     {{0x50,0x01},{0xa7}}, //>>>optimisation enables,  SDE[7], Scaling[5],   UVav[2],CMX[1],AWB[0]
 	//AWB+CMX=important,else colors wrong, UVaverage gives better color contrast.was 0xa3
 	
@@ -258,10 +256,10 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
     {{0x50,0x25},{0x00}}, //????
 	
 //***** banding filter: 50/60Hz detector control (register 0x3c01 and 0x3a00)
-    {{0x3c,0x00},{0x04}}, //50/60 Hz manual Band select ( Band50 default value). default:0x00
-    {{0x3c,0x01},{0x00}}, // default:0x00=off.0x34=0n.AutoBanding[7], Sum auto mode enable[5], Band counter enable[4], Counter threshold[3-0] for band change = 4
+    {{0x3c,0x00},{0x04}}, //04,00//50/60 Hz manual Band select ( Band50 default value). default:0x00
+    {{0x3c,0x01},{0x00}}, //b4,34// default:0x00=off.0x34=0n.AutoBanding[7], Sum auto mode enable[5], Band counter enable[4], Counter threshold[3-0] for band change = 4
 //- AutoBanding(3c01_7) = if on(0), will detect 50 or 60 hz light frequency automaticly. default:0x00
-//  BandFunctionOn(3aA00_5) must be OFF to work. Then banding will be done automaticly.
+//  BandFunctionOn(3a00_5) must be OFF to work. Then banding will be done automaticly.
 
     {{0x3c,0x04},{0x28}},//5060HZ CTRL04:Threshold for low sum default:0x20
     {{0x3c,0x05},{0x98}},//5060HZ CTRL05: Threshold for high sum. default:0x70
@@ -276,14 +274,18 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
 //control:
     {{0x35,0x03},{0x00}}, // AEC AGC auto enable(0). AECauto[0], AGCauto[1] default: 0x00 = both enabled
 //nightmode+banding:	
-    {{0x3a,0x00},{0x04}},  //AEC Band Night: BandFunctionOn[5], NightModeOn[2] default:0x78=BandingOn
-//- bandauto(3aA00_5) = auto banding, if on, aec is done in steps of "band steps". if off, aec is continuoues.
+    {{0x3a,0x00},{0x78}},  //AEC Band Night: BandFunctionOn[5], NightModeOn[2] default:0x78=BandingOn. 0x7C=nightmode
+//- BandFunctionOn(3a00_5) = manual Bandfilter on(1), if on, aec is done in steps of "band steps". if off, aec is continuoues.
+//                            0x3c01[7] must be 1=manual, and the relevant 50 or 60 hz frequency must be selected in same register.
 
     {{0x3a,0x05},{0x30}}, //NightModeInsertFrames[6] , exposureStepAuto[5],step auto-ratio can be set in bits 0-4.default:0x30
 
-    {{0x3a,0x17},{0x03}}, //[1:0]   Gain night threshold = gain value when in nightmode
+    {{0x3a,0x17},{0x03}}, //[1:0]   Gain night threshold = gain value from which nightmode will be enabled (auto-nightmode)
+	                      //0=always, 01=10, 10=30, 11=70, that is if gain in reg 0x350a-0b is >70, nightmode goes on.
+
+//nightmode max exposure: This the the longest exposure you can do in nightmode (keep both values the same)
     {{0x3a,0x02},{0x3f}},// AEC Max exposure 60Hz = 16bit 16bit max_exposure60hz
-    {{0x3a,0x03},{0xff}},// default: 15744.
+    {{0x3a,0x03},{0xff}},// default: 15744.  maxval =0x3fff
 	
     {{0x3a,0x14},{0x3f}},// AEC Max exposure 50Hz = 16bit max_exposure50hz
     {{0x3a,0x15},{0xff}},// AEC Max exposure 50Hz. default: 3648
@@ -305,19 +307,20 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
     {{0x3a,0x1f},{0x14}}, // Fast Zone Low Limit
 //Gain:	
     {{0x3a,0x13},{0x43}},// pre-gain enable[6], pregain value[5-0]. default:0x40 = pregain is on with gain = 1x
-//    {{0x3a,0x18},{0x00}},// AEC gain ceiling[9:8] default:0x03e0 = max allowed gain 
-//default max test!    {{0x3a,0x19},{0xf8}},// AEC gain ceiling[7:0]
+	//gain ceiling:
+    {{0x3a,0x18},{0x00}},// AGC gain ceiling[9:8] default:0x03e0 = max allowed gain 
+    {{0x3a,0x19},{0xf8}},// AGC gain ceiling[7:0]  the higher the limit, the lower the exposure time can be. medium values are good.
 	
 //***** subsample and binning  (Scaling see above)
     {{0x38,0x14},{0x31}},// horizontal subsampling on
     {{0x38,0x15},{0x31}},// vertical subsampling on = 2x2 binning, reduces picturesize by 4
     {{0x38,0x21},{0x01}}, // horizontal binning on[0] =1  for 2x2.default:0x00, hbinninOn=0x01
-	
-    {{0x36,0x18},{0x00}},// ??mustbe
-    {{0x36,0x12},{0x29}},// ??must be
-    {{0x37,0x08},{0x64}},// ??
-    {{0x37,0x09},{0x52}},// ??
-    {{0x37,0x0c},{0x03}},// to here must be <<<<<
+// other subsample settings (undocumented): this for subsample=ON
+    {{0x36,0x18},{0x00}},// 0x04 ??mustbe
+    {{0x36,0x12},{0x29}},// 0x2b ??mustbe
+    {{0x37,0x08},{0x64}},// ??mustbe
+    {{0x37,0x09},{0x52}},// 0x12 ??mustbe
+    {{0x37,0x0c},{0x03}},// 0x00 to here must be <<<<<
 	
 //***** Blacklevel Control BLC  (auto enable=0x4002 = 0x45=default)
     {{0x40,0x01},{0x02}},// BLC control1: BLC starting line = 2. default:0x00
@@ -345,20 +348,21 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
     {{0x38,0x06},{0x07}},//end y = 1947 , so y=1944
     {{0x38,0x07},{0x9b}},//
 
+
     {{0x38,0x08},{0x02}},//  640
     {{0x38,0x09},{0x80}},//
     {{0x38,0x0a},{0x01}},// 480
     {{0x38,0x0b},{0xe0}},//
 
-    {{0x38,0x0c},{0x07}},//  HTS 1896. 0x0768 = 2844/3 * 2
-    {{0x38,0x0d},{0x68}},//
+    {{0x38,0x0c},{0x07}},//  HTS 1896. 0x0768 = 2844/3 * 2, horizontal odd_inc=3, even_inc=1,
+    {{0x38,0x0d},{0x68}},//  subsample factor = (even_inc + odd_inc) / 2. example: 3+1=4/2=2
     {{0x38,0x0e},{0x03}},//  VTS 984. 0x03d8 = 1968/2
     {{0x38,0x0f},{0xd8}},//
 
     {{0x38,0x10},{0x00}},//x-offsett 16, so x=2624 - 32 = 2592
     {{0x38,0x11},{0x10}},//
     {{0x38,0x12},{0x00}},//
-    {{0x38,0x13},{0x06}},// y-offset 6, so y=1944 - 12 = 1932
+    {{0x38,0x13},{0x06}},//y-offset 6, so y=1944 - 12 = 1932
 //window size end
 
 
@@ -396,7 +400,6 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
     {{0x36,0x36},{0x03}},// ??mustbe
     {{0x36,0x34},{0x40}},//
     {{0x36,0x22},{0x01}},//
-
 
 //+++  image sensor processor ISP digital functions +++
 // ISP: Automatic whitebalance AWB settings:
@@ -557,7 +560,7 @@ static struct regval_list sensor_init_regs[] =  //default: VGA 640x480, 15fps, s
 };
 
 // full resolution (32 dummy pixel horizontal, 8 dummy lines vertical), 2624x1952 with dummy
-static struct regval_list sensor_qsxga_regs[] =   //qsxga: 2592*1944, pclk:28m, 5 fps, subsample Off, Scaling Off
+static struct regval_list regs_QSXGA_FULL_2592_1944[] =   //qsxga: 2592*1944, pclk:28m, 4:3, 5 fps, subsample Off, Scaling Off
 {
     {{0x30,0x08},{0x42}},	//stop streaming during register setting
 
@@ -616,8 +619,8 @@ static struct regval_list sensor_qsxga_regs[] =   //qsxga: 2592*1944, pclk:28m, 
 };
 
 
-// cropping from full resolution , 1952x1088 with dummy pixels. 15 fps
-static struct regval_list sensor_1080p_regs[] =   //1080: 1920*1080 , pclk:42m, 7 fps, subsample Off, Scaling Off
+// cropping to 1920x1080  
+static struct regval_list regs_HD1080_1920_1080[] = //1080: 1920*1080 , pclk:42m, 16:9, 15 fps, subsample Off, Scaling Off
 {
     {{0x30,0x08},{0x42}},	//stop streaming during register setting
 
@@ -668,66 +671,8 @@ static struct regval_list sensor_1080p_regs[] =   //1080: 1920*1080 , pclk:42m, 
 };
 
 
-
-
-// cropping to 2560x1440, subsampling to 1280 720. 30 fps
-static struct regval_list sensor_720p_regs[] =   //1280*720, pclk:42m, 30 fps, subsample On, Scaling Off --griselig
-{
-    {{0x30,0x08},{0x42}},	//stop streaming during register setting
-
-
-//Scaling off!!	
-    {{0x50,0x01},{0x87}}, //>>>optimisation enables,  SDE[7], Scaling[5],   UVav[2],CMX[1],AWB[0]
-//***** subsample and binning on (Scaling see above)
-    {{0x38,0x14},{0x31}},// horizontal subsampling on
-    {{0x38,0x15},{0x31}},// vertical subsampling on = 2x2 binning, reduces picturesize by 4
-    {{0x38,0x21},{0x01}}, // horizontal binning on[0] =1  for 2x2.default:0x00, hbinninOn=0x01
-//for subsample=ON
-	{{0x36,0x18}, {0x00}}, 
-	{{0x36,0x12}, {0x29}}, 
-	{{0x37,0x09}, {0x52}}, 
-	{{0x37,0x0c}, {0x03}}, 
-
- // PLL Settings = Pixelclock:
-    {{0x30,0x34},{0x1a}},//(6-4)=charge pump loop filter. (3-0)=BITdivider. 1a=10bit(default), 18=8bit(a bit faster!)
-    {{0x30,0x35},{0x21}},//(7-4)=SystemClockDivider. (3-0)=MIPIdivider(must stay at 1!). default=0x11
-    {{0x30,0x36},{0x69}},//(7-0)=Multipiler. default=0x69.  0x46->30fps
-    {{0x30,0x37},{0x13}},//(4)=Rootdivider. (3-0)=Predivider.  default=0x03.
-    {{0x31,0x08},{0x01}},//(5-4)=PCLK Rootdivider=0;(3-2)=sclk2x root divider=dontcare; (1-0)=SCLK root divider; default:0x16.
-
-// window size	
-	
-    {{0x38,0x00},{0x00}},
-    {{0x38,0x01},{0x00}},
-    {{0x38,0x02},{0x00}}, // y 250
-    {{0x38,0x03},{0xfa}},
-    {{0x38,0x04},{0x0a}}, //2591
-    {{0x38,0x05},{0x1f}},
-    {{0x38,0x06},{0x06}}, //1697 = 1448
-    {{0x38,0x07},{0xa1}},
-	
-    {{0x38,0x08},{0x05}}, //1280
-    {{0x38,0x09},{0x00}},
-    {{0x38,0x0a},{0x02}}, //720
-    {{0x38,0x0b},{0xd0}},
-	
-    {{0x38,0x0c},{0x07}}, // HTS 1892
-    {{0x38,0x0d},{0x64}},
-    {{0x38,0x0e},{0x02}}, // VTS 740
-    {{0x38,0x0f},{0xe4}},
-	
-    {{0x38,0x10},{0x00}}, //16 - 2560
-    {{0x38,0x11},{0x10}},
-    {{0x38,0x12},{0x00}}, //4 - 1440
-    {{0x38,0x13},{0x04}},
-	
-    {{0x30,0x08},{0x02}}, //poweron at end. start sensor streaming
-	
-
-};
-
 //scaling down from full resolution 
-static struct regval_list sensor_sxga_regs[] =   //SXGA: 1280*960, pclk:28m, 5 fps, subsample Off, Scaling On
+static struct regval_list regs_SXGA_1280_960[] =   //SXGA: 1280*960, pclk:28m, 4:3, 5 fps, subsample Off, Scaling On
 {
     {{0x30,0x08},{0x42}},	//stop streaming during register setting
 
@@ -767,9 +712,9 @@ static struct regval_list sensor_sxga_regs[] =   //SXGA: 1280*960, pclk:28m, 5 f
     {{0x38,0x0a},{0x03}},
     {{0x38,0x0b},{0xc0}},
 	
-    {{0x38,0x0c},{0x0b}}, // HTS 
+    {{0x38,0x0c},{0x0b}}, // HTS 2844
     {{0x38,0x0d},{0x1c}},
-    {{0x38,0x0e},{0x07}}, // VTS 
+    {{0x38,0x0e},{0x07}}, // VTS 1968
     {{0x38,0x0f},{0xb0}},
 
     {{0x38,0x10},{0x00}}, //16 - 2592
@@ -784,8 +729,193 @@ static struct regval_list sensor_sxga_regs[] =   //SXGA: 1280*960, pclk:28m, 5 f
 };
 
 
-//same as 640x480, but scaling further down 
-static struct regval_list sensor_qvga_regs[] =   //QVGA: 320 * 240, pclk:28m, 15 fps, subsample On, Scaling On
+// HD720(720p): cropping to 2560x1440, subsampling to 1280 720, thus doubling fps to 30.
+static struct regval_list regs_HD720_1280_720[] =   //1280*720, pclk:42m, 16:9, 30 fps, subsample On, Scaling Off 
+{
+    {{0x30,0x08},{0x42}},	//stop streaming during register setting
+
+
+//Scaling off!!	
+    {{0x50,0x01},{0x87}}, //>>>optimisation enables,  SDE[7], Scaling[5],   UVav[2],CMX[1],AWB[0]
+//***** subsample and binning on (Scaling see above)
+    {{0x38,0x14},{0x31}},// horizontal subsampling on
+    {{0x38,0x15},{0x31}},// vertical subsampling on = 2x2 binning, reduces picturesize by 4
+    {{0x38,0x21},{0x01}}, // horizontal binning on[0] =1  for 2x2.default:0x00, hbinninOn=0x01
+//for subsample=ON
+	{{0x36,0x18}, {0x00}}, 
+	{{0x36,0x12}, {0x29}}, 
+	{{0x37,0x09}, {0x52}}, 
+	{{0x37,0x0c}, {0x03}}, 
+
+ // PLL Settings = Pixelclock:
+    {{0x30,0x34},{0x1a}},//(6-4)=charge pump loop filter. (3-0)=BITdivider. 1a=10bit(default), 18=8bit(a bit faster!)
+    {{0x30,0x35},{0x21}},//(7-4)=SystemClockDivider. (3-0)=MIPIdivider(must stay at 1!). default=0x11
+    {{0x30,0x36},{0x69}},//(7-0)=Multipiler. default=0x69.  0x46->30fps
+    {{0x30,0x37},{0x13}},//(4)=Rootdivider. (3-0)=Predivider.  default=0x03.
+    {{0x31,0x08},{0x01}},//(5-4)=PCLK Rootdivider=0;(3-2)=sclk2x root divider=dontcare; (1-0)=SCLK root divider; default:0x16.
+
+// window size	
+/*	
+    {{0x38,0x00},{0x00}}, // xstart=0   .. These actual correct settings cause i2c error, bus is busy   ???
+    {{0x38,0x01},{0x00}},
+    {{0x38,0x02},{0x00}}, // ystart = 250
+    {{0x38,0x03},{0xfa}},
+    {{0x38,0x04},{0x0a}}, //xend 2591 = 2592 - 32 = 2560
+    {{0x38,0x05},{0x1f}},
+    {{0x38,0x06},{0x06}}, //yend 1697 = 1448 - 8 = 1440
+    {{0x38,0x07},{0xa1}},
+*/
+    {{0x38,0x00},{0x00}}, // xstart=0   ... so we use original settings.
+    {{0x38,0x01},{0x00}},
+    {{0x38,0x02},{0x00}}, // ystart = 250
+    {{0x38,0x03},{0xfa}},
+    {{0x38,0x04},{0x0a}}, //xend 2623 = 2624 - 32 = 2592
+    {{0x38,0x05},{0x3f}},
+    {{0x38,0x06},{0x06}}, //yend 1705 = 1456 - 8 = 1448
+    {{0x38,0x07},{0xa9}},
+	
+    {{0x38,0x08},{0x05}}, //1280
+    {{0x38,0x09},{0x00}},
+    {{0x38,0x0a},{0x02}}, //720
+    {{0x38,0x0b},{0xd0}},
+	
+    {{0x38,0x0c},{0x07}}, // HTS 1892
+    {{0x38,0x0d},{0x64}},
+    {{0x38,0x0e},{0x02}}, // VTS 740
+    {{0x38,0x0f},{0xe4}},
+	
+    {{0x38,0x10},{0x00}}, //16 
+    {{0x38,0x11},{0x10}},
+    {{0x38,0x12},{0x00}}, //4 
+    {{0x38,0x13},{0x04}},
+	
+    {{0x30,0x08},{0x02}}, //poweron at end. start sensor streaming
+	
+
+};
+
+
+// SVGA 800*600: cropping to 1600*1200, subsampling to 800*600, thus doubling fps to 30.
+static struct regval_list regs_SVGA_800_600[] =   //800*600, pclk:xxm, 4:3, 30 fps, subsample On, Scaling Off 
+{
+    {{0x30,0x08},{0x42}},	//stop streaming during register setting
+
+
+//Scaling off!!	
+    {{0x50,0x01},{0x87}}, //>>>optimisation enables,  SDE[7], Scaling[5],   UVav[2],CMX[1],AWB[0]
+//***** subsample and binning on (Scaling see above)
+    {{0x38,0x14},{0x31}},// horizontal subsampling on
+    {{0x38,0x15},{0x31}},// vertical subsampling on = 2x2 binning, reduces picturesize by 4
+    {{0x38,0x21},{0x01}}, // horizontal binning on[0] =1  for 2x2.default:0x00, hbinninOn=0x01
+//for subsample=ON
+	{{0x36,0x18}, {0x00}}, 
+	{{0x36,0x12}, {0x29}}, 
+	{{0x37,0x09}, {0x52}}, 
+	{{0x37,0x0c}, {0x03}}, 
+
+ // PLL Settings = Pixelclock:
+    {{0x30,0x34},{0x1a}},//(6-4)=charge pump loop filter. (3-0)=BITdivider. 1a=10bit(default), 18=8bit(a bit faster!)
+    {{0x30,0x35},{0x21}},//(7-4)=SystemClockDivider. (3-0)=MIPIdivider(must stay at 1!). default=0x11
+    {{0x30,0x36},{0x69}},//(7-0)=Multipiler. default=0x69.  0x46->30fps
+    {{0x30,0x37},{0x13}},//(4)=Rootdivider. (3-0)=Predivider.  default=0x03.
+    {{0x31,0x08},{0x01}},//(5-4)=PCLK Rootdivider=0;(3-2)=sclk2x root divider=dontcare; (1-0)=SCLK root divider; default:0x16.
+
+// window size	, we crob to the center from 2624*1952 with dummys
+
+    {{0x38,0x00},{0x02}}, // xstart; 2624-1600=1024:2=512
+    {{0x38,0x01},{0x00}},
+    {{0x38,0x02},{0x01}}, // ystart: 1952-1200=752:2=376
+    {{0x38,0x03},{0x78}},
+    {{0x38,0x04},{0x08}}, //xend 512+1600=2112+32=2144 -1=2143
+    {{0x38,0x05},{0x5f}},
+    {{0x38,0x06},{0x06}}, //yend 376+1200=1576+8=1584 -1=1583
+    {{0x38,0x07},{0x2f}},
+	
+    {{0x38,0x08},{0x03}}, //800
+    {{0x38,0x09},{0x20}},
+    {{0x38,0x0a},{0x02}}, //600
+    {{0x38,0x0b},{0x58}},
+	
+    {{0x38,0x0c},{0x05}}, // HTS  1422
+    {{0x38,0x0d},{0x8e}},
+    {{0x38,0x0e},{0x02}}, // VTS  616
+    {{0x38,0x0f},{0x68}},
+	
+    {{0x38,0x10},{0x00}}, //16 
+    {{0x38,0x11},{0x10}},
+    {{0x38,0x12},{0x00}}, //4 
+    {{0x38,0x13},{0x04}},
+	
+    {{0x30,0x08},{0x02}}, //poweron at end. start sensor streaming
+	
+
+};
+
+
+// fastVGA 644*484: cropping to 1288*968, subsampling to 644*484, thus doubling fps to 30.
+static struct regval_list regs_fastVGA_644_484[] =   //644*484, pclk:xxm, 4:3, 30 fps, subsample On, Scaling Off 
+{
+    {{0x30,0x08},{0x42}},	//stop streaming during register setting
+
+
+//Scaling off!!	
+    {{0x50,0x01},{0x87}}, //>>>optimisation enables,  SDE[7], Scaling[5],   UVav[2],CMX[1],AWB[0]
+//***** subsample and binning on (Scaling see above)
+    {{0x38,0x14},{0x31}},// horizontal subsampling on
+    {{0x38,0x15},{0x31}},// vertical subsampling on = 2x2 binning, reduces picturesize by 4
+    {{0x38,0x21},{0x01}}, // horizontal binning on[0] =1  for 2x2.default:0x00, hbinninOn=0x01
+//for subsample=ON
+	{{0x36,0x18}, {0x00}}, 
+	{{0x36,0x12}, {0x29}}, 
+	{{0x37,0x09}, {0x52}}, 
+	{{0x37,0x0c}, {0x03}}, 
+
+ // PLL Settings = Pixelclock:
+    {{0x30,0x34},{0x1a}},//(6-4)=charge pump loop filter. (3-0)=BITdivider. 1a=10bit(default), 18=8bit(a bit faster!)
+    {{0x30,0x35},{0x21}},//(7-4)=SystemClockDivider. (3-0)=MIPIdivider(must stay at 1!). default=0x11
+    {{0x30,0x36},{0x69}},//(7-0)=Multipiler. default=0x69.  0x46->30fps
+    {{0x30,0x37},{0x13}},//(4)=Rootdivider. (3-0)=Predivider.  default=0x03.
+    {{0x31,0x08},{0x01}},//(5-4)=PCLK Rootdivider=0;(3-2)=sclk2x root divider=dontcare; (1-0)=SCLK root divider; default:0x16.
+
+// window size	, we crob to the center from 2624*1952 with dummys
+
+    {{0x38,0x00},{0x02}}, // xstart; 2624-1288=1336:2=668
+    {{0x38,0x01},{0x9c}},
+    {{0x38,0x02},{0x01}}, // ystart: 1952-968=984:2=492
+    {{0x38,0x03},{0xec}},
+    {{0x38,0x04},{0x07}}, //xend 668+1288=1956+32=1988 -1=1987      
+    {{0x38,0x05},{0xc3}},
+    {{0x38,0x06},{0x05}}, //yend 492+968=1460+8=1468 -1=1467   
+    {{0x38,0x07},{0xbb}},
+	
+    {{0x38,0x08},{0x02}}, //644
+    {{0x38,0x09},{0x84}},
+    {{0x38,0x0a},{0x01}}, //484
+    {{0x38,0x0b},{0xe4}},
+	
+    {{0x38,0x0c},{0x05}}, // HTS  1422
+    {{0x38,0x0d},{0x8e}},
+    {{0x38,0x0e},{0x01}}, // VTS  500
+    {{0x38,0x0f},{0xf4}},
+	
+    {{0x38,0x10},{0x00}}, //16 
+    {{0x38,0x11},{0x10}},
+    {{0x38,0x12},{0x00}}, //4 
+    {{0x38,0x13},{0x04}},
+	
+    {{0x30,0x08},{0x02}}, //poweron at end. start sensor streaming
+	
+
+};
+
+
+
+
+
+
+
+//same as 640x480 using subsample, but scaling further down 
+static struct regval_list regs_QVGA_320_240[] =   //QVGA: 320 * 240, pclk:28m, 4:3, 15 fps, subsample On, Scaling On
 {
     {{0x30,0x08},{0x42}},	//stop streaming during register setting
 
@@ -831,40 +961,12 @@ static struct regval_list sensor_qvga_regs[] =   //QVGA: 320 * 240, pclk:28m, 15
 
     {{0x38,0x10},{0x00}}, //16 - 2592
     {{0x38,0x11},{0x10}},
-    {{0x38,0x12},{0x00}}, //6 - 1932
+    {{0x38,0x12},{0x00}}, //6 - 1932 This odd setting is necessary to achive stable picture
     {{0x38,0x13},{0x06}},
-/*
 
-    {{0x38,0x00},{0x00}},
-    {{0x38,0x01},{0x00}},
-    {{0x38,0x02},{0x00}}, 
-    {{0x38,0x03},{0x00}},
-
-    {{0x38,0x04},{0x0a}}, //2623
-    {{0x38,0x05},{0x3f}},
-    {{0x38,0x06},{0x07}}, //1951
-    {{0x38,0x07},{0x9f}},
-	
-
-    {{0x38,0x08},{0x01}}, //320
-    {{0x38,0x09},{0x40}},
-    {{0x38,0x0a},{0x00}}, //240
-    {{0x38,0x0b},{0xf0}},
-	
-    {{0x38,0x0c},{0x07}}, //HTS 1896
-    {{0x38,0x0d},{0x68}},
-    {{0x38,0x0e},{0x03}}, //VTS 984. 976
-    {{0x38,0x0f},{0xd8}},
-
-    {{0x38,0x10},{0x00}}, //16 - 2592
-    {{0x38,0x11},{0x10}},
-    {{0x38,0x12},{0x00}}, //4 - 1944
-    {{0x38,0x13},{0x04}},
-*/	
     {{0x30,0x08},{0x02}}, //poweron at end. start sensor streaming
 	
 };
-
 
 
 // +++:++++++++++++++++++++  Sensor Register Value Lists for color formats  ***************************
@@ -903,10 +1005,10 @@ static struct sensor_format_struct
     {
         .fourcc		=  V4L2_PIX_FMT_YUYV,  //yuyv direct from camera, geht
         .bitsperpixel	= 16,
-        .csi_input = CSI_RAW,
+        .csi_input = CSI_RAW,  // no csi conversion please
         .csi_output = CSI_PASS_THROUTH,
-        .byte_order = 0,
-        .regs 		= sensor_fmt_yuv422_yuyv,
+        .byte_order = 0,  // not used for raw input
+        .regs 		= sensor_fmt_yuv422_yuyv,  // registers for setting this color format
         .regs_size = ARRAY_SIZE(sensor_fmt_yuv422_yuyv),
     },
 
@@ -922,57 +1024,102 @@ static struct sensor_format_struct
 */
 static struct sensor_win_size
 {
-    int	width;
-    int	height;
+    unsigned short	width;
+    unsigned short	height;
+	unsigned short min_fps;
+	unsigned short def_fps;
+	unsigned short max_fps;
     // register list
     struct regval_list *regs;
     int regs_size;
 } sensor_win_sizes[] =
 {
-    /* qsxga: 2592*1944 */
+    /* qsxga: 2592*1944 4:3 */
     {
         .width			= 2592,
         .height 		= 1944,
-        .regs			= sensor_qsxga_regs,
-        .regs_size	= ARRAY_SIZE(sensor_qsxga_regs),
+		.min_fps			= 2,
+		.def_fps			= 5,
+		.max_fps			= 8,
+        .regs			= regs_QSXGA_FULL_2592_1944,
+        .regs_size	= ARRAY_SIZE(regs_QSXGA_FULL_2592_1944),
     },
 
-    /* 1080P */
+    /* FullHD, HD1080 4:2,25=16x9*/
     {
         .width			= 1920,
         .height			= 1080,
-        .regs 			= sensor_1080p_regs,
-        .regs_size	= ARRAY_SIZE(sensor_1080p_regs),
+		.min_fps			= 3,
+		.def_fps			= 15,
+		.max_fps			= 17,
+        .regs 			= regs_HD1080_1920_1080,
+        .regs_size	= ARRAY_SIZE(regs_HD1080_1920_1080),
     },
 
-    /* SXGA */
+    /* SXGA 1280x1024 but 1280x960 = 4:3*/
     {
         .width			= 1280,
         .height 		= 960,
-        .regs			= sensor_sxga_regs,
-        .regs_size	= ARRAY_SIZE(sensor_sxga_regs),
+		.min_fps			= 2,
+		.def_fps			= 5,
+		.max_fps			= 8,
+        .regs			= regs_SXGA_1280_960,
+        .regs_size	= ARRAY_SIZE(regs_SXGA_1280_960),
     },
-    /* 720p */
+    /* HD720 4:2,25=16x9*/
     {
         .width			= 1280,
         .height			= 720,
-        .regs 			= sensor_720p_regs,
-        .regs_size	= ARRAY_SIZE(sensor_720p_regs),
+		.min_fps			= 5,
+		.def_fps			= 15,
+		.max_fps			= 30, //max 34
+        .regs 			= regs_HD720_1280_720,
+        .regs_size	= ARRAY_SIZE(regs_HD720_1280_720),
+    },
+	
+    /* SVGA 4:3*/
+    {
+        .width			= 800,
+        .height			= 600,
+		.min_fps			= 8,
+		.def_fps			= 30,
+		.max_fps			= 50, //max 53
+        .regs 			= regs_SVGA_800_600,
+        .regs_size	= ARRAY_SIZE(regs_SVGA_800_600),
     },
 
-    /* VGA */
+    /* fastVGA 4:3*/
+    {
+        .width			= 644,
+        .height			= 484,
+		.min_fps			= 12,
+		.def_fps			= 30,
+		.max_fps			= 65,
+        .regs 			= regs_fastVGA_644_484,
+        .regs_size	= ARRAY_SIZE(regs_fastVGA_644_484),
+    },
+	
+    /* VGA 4:3*/
     {
         .width			= 640,
         .height			= 480,
-        .regs				=  sensor_init_regs, //sensor_vga_regs,
-        .regs_size	= ARRAY_SIZE(sensor_init_regs),
+		.min_fps			= 4,
+		.def_fps			= 15,
+		.max_fps			= 25,
+        .regs				=  regs_init_VGA, //sensor_vga_regs,
+        .regs_size	= ARRAY_SIZE(regs_init_VGA),
     },
+	// QVGA 4:3
     {
         .width			= 320,
         .height			= 240,
-        .regs				=  sensor_qvga_regs, 
-        .regs_size	= ARRAY_SIZE(sensor_qvga_regs),
+		.min_fps			= 4,
+		.def_fps			= 15,
+		.max_fps			= 25,
+        .regs				=  regs_QVGA_320_240, 
+        .regs_size	= ARRAY_SIZE(regs_QVGA_320_240),
     },
+// pclk=fps*hts*vts; fps=pclk/(hts+vts)
 
 };
 
@@ -1098,7 +1245,7 @@ static int sensor_write_array(struct v4l2_subdev *sd, struct regval_list *vals ,
             ret = sensor_write(sd, vals->reg_num, vals->value);
             if (ret < 0)
             {
-                csi_debug(3,"sensor_write_err!\n");
+                csi_debug(3,"sensor_write_err,abort array!\n");
                 return ret;
             }
         }
@@ -1115,49 +1262,84 @@ static int sensor_write_array(struct v4l2_subdev *sd, struct regval_list *vals ,
 
 
 
+
+
 /** get pixel clock
-exit: 0= error, else pixelclock
+
+The pixelclock depends on: MCLK into the camera, PLL and divider settings
+should not exceed 48 mhz
+
+if not nightmode, vts_extra is 0!
+dont set pclk when in nightmode!
+Max pclk is 48Mhz.(The bus cannot do more) ??
+Min pclk is 600000
+Max VCO is 800Mhz to 1000Mhz.
+
+
+Set pclk for given fps:
+
+
+    pclk=fps*vts*hts
+	if pclk is > 48Mhz return error , tested! csi bus cannot do more!
+	if pclk < 7Mhzreturn error  (to further slow down,  extend VTS at given minimum pclk )
+
+check VCO and Rootdivider:
+
+set Rootdivider;	
+VCO=(pclk/10)*SYSdivider*Rootdivider   target is 500Mhz 
+if VCO > 600Mhz clear Rootdivider and recalc.
+
+if VCO > 960 Mhz return error
+if VCO < 12 Mhz also problem but we check that later.
+
+Set Predivider:
+
+Predivider*10 = (Multiplier*MCLK*10)/VCO = (35*MCLK*10)/VCO = middle range Multiplier value
+If Predivider < 16, Predivider=1;
+If Predivider > 15 <25  Predivider = 2
+If Predivider > 25 <35 Predivider = 3
+If Predivider > 35 <50 Predivider = 4
+If Predivider > 50 <71Predivider = 6
+If Predivider > 70, Predivider=8;
+
+Calc Multiplier:
+Multiplier= VCO*Predivider/MCLK
+Min=4, max=252, >128 only even.
+
+Finally write Predivider, Multiplier, Rootdivider   to registers.
+
+entry: 
+- subdev handle
+- fps = wanted fps to set 	pclk, or 0 to just calc current pclk.
+exit: 0= error, else pixelclock (either current or set)
 */
-static ulong get_pclk(struct v4l2_subdev *sd)
+static ulong get_pclk(struct v4l2_subdev *sd, unsigned short fps)
 {
     struct sensor_info *info = to_state(sd);
     unsigned long pclk,VCO,SYSdivider;
     unsigned char Predivider,Multiplier,SystemClockDivider,Rootdivider,BITdivider,PCLKdivider;
-    unsigned char address[REG_ADDR_STEP];
+    unsigned char address[REG_ADDR_STEP],data;
+	unsigned short hts, vts;
 
 
         address[0]=0x30;
         address[1]=0x37;
     sensor_read(i2cdev, address, &Predivider);
-    Predivider = Predivider & 0x0f; //Predivider
+    Predivider = Predivider & 0x0f; //Predivider, datasheet says:1, 2, 3, 4, 6, 8 - only
 	//(0=1;1=1;2=2;3=3;4=4;5=1.5;6=6;7=2.5;8=8;9-15=1;) we take *10 to support fraction
+
+
 	switch (Predivider)
 	{
-	case 2:
-	Predivider=20;//2
-	break;
-	case 3:
-	Predivider=30;//3
-	break;
-	case 4:
-	Predivider=40;//4
-	break;
-	case 5:
-	Predivider=15;//1.5
-	break;
-	case 6:
-	Predivider=60;//6
-	break;
-	case 7:
-	Predivider=25;//2.5
-	break;
-	case 8:
-	Predivider=80;//8
-	break;
-	case 0:
 	case 1:
+	case 2:
+	case 3:
+	case 4:
+	case 6:
+	case 8:
+	break;
 	default:
-	Predivider=10; //1
+	csi_debug(2,"Predivider wrong value: %u\n",Predivider);
 	break;
 	}
 
@@ -1207,22 +1389,159 @@ break;
    PCLKdivider = 1 << PCLKdivider;
 
 
-		VCO = (MCLK / Predivider) * Multiplier * 10;
+		VCO = (MCLK / Predivider) * Multiplier;
 
-SYSdivider = SystemClockDivider * Rootdivider * BITdivider * PCLKdivider;
+SYSdivider = SystemClockDivider  * BITdivider * PCLKdivider;
 
-        pclk = (VCO / SYSdivider) * 10;
+        pclk = (VCO / (SYSdivider* Rootdivider)) * 10;
+		
+// set pclk if a specific fps is wanted
+if (fps)
+{
+// check if nightmode is on, if so ignore any settings
+address[0]=0x3a;
+address[1]=0x00;
+sensor_read(i2cdev, address, &data);
+	if (!(data&0x04)) // nightmode is off
+	{ 
+// calc pclk:
+        address[0]=0x38;
+			address[1]=0x0C;
+		sensor_read(i2cdev, address, &data); // pclk per line  HTS
+		hts = data<<8;
+		   address[1]=0x0D;
+		sensor_read(i2cdev, address, &data);
+		hts |= data;
+		
+		
+		   address[1]=0x0E;
+		sensor_read(i2cdev, address, &data); //number of lines  VTS
+		vts = data<<8;
+		   address[1]=0x0F;
+		sensor_read(i2cdev, address, &data);
+		vts |= data;
+		
+		pclk = fps*hts*vts; // the wanted pclk
 
-    csi_debug(2,"Predivider = %d,Multiplier = %d,SystemClockDivider = %d,Rootdivider = %d,BITdivider = %d,PCLKdivider = %d\n",\
-                Predivider,Multiplier,SystemClockDivider,Rootdivider,BITdivider,PCLKdivider);
-csi_debug(2,"Pxclk: %lu  VCO:%lu SYSDIV: %lu\n",pclk,VCO,SYSdivider);
+		// aufrunden auf 100000der: ((zahl+auf/2)/auf)*auf= aufgerundet.
+		pclk=((pclk+50000)/100000) * 100000;
+csi_debug(2,"pclk:%lu fps:%u hts:%u vts:%u",pclk,fps,hts,vts);	
+		
+// check pclk for limits:		
+		if (pclk > 48100000) return(0);  // **** CONSTANT CONFIG!!!!
+		if (pclk < 7000000) return(0); //  **** CONSTANT CONFIG!!!!	seems csi does not handle slower pclk
+// calc VCO and set Rootdivider correctly
+		Rootdivider = 2; // set Rootdivider
+		VCO=(pclk/10)*SYSdivider*Rootdivider;  
+csi_debug(2,"VCO:%lu",VCO);	
+		
+		if (VCO > 600000000) // **** CONSTANT CONFIG!!!!
+		{
+		Rootdivider = 1; // clear Rootdivider
+		VCO=(pclk/10)*SYSdivider*Rootdivider;  
+csi_debug(2,"VCO:%lu",VCO);	
+		}
+
+		if (VCO > 960000000) return(0); // **** CONSTANT CONFIG!!!!
+		if (VCO < 12000000) return(0); // **** CONSTANT CONFIG!!!!
+
+//Set Predivider based on middle Multiplier:
+		Predivider = ((70*MCLK)/(VCO/10)); // = middle range Multiplier **** CONSTANT CONFIG!!!!  was 35
+csi_debug(2,"Prediv:%u",Predivider);	
+		
+		if (Predivider < 16) Predivider=1;
+		else if ((Predivider > 15)&&(Predivider < 26)) Predivider = 2;
+		else if ((Predivider > 25)&&(Predivider < 36)) Predivider = 3;
+		else if ((Predivider > 35)&&(Predivider < 51)) Predivider = 4;
+		else if ((Predivider > 50)&&(Predivider < 71)) Predivider = 6;
+		else Predivider=8;
+
+
+//Calc Multiplier:
+//VCO = (MCLK / Predivider) * Multiplier;
+//pclk = (VCO / (SYSdivider* Rootdivider)) * 10;
+//tpclk
+		Multiplier= VCO*Predivider/MCLK;
+		Multiplier++; // round up
+csi_debug(2,"Multiplier:%u",Multiplier);	
+		
+		if (Multiplier > 128) Multiplier &= 0xFE; // only even values above 128
+		if ((Multiplier < 4)||(Multiplier>252)) return(0);
+
+	
+	// OK, lets set the parameters for pclk: Predivider, Multiplier, Rootdivider.
+	
+// also done in sensor_power-standby!!	
+	    address[0]=0x30;
+        address[1]=0x08;
+		data=0x42; //stop streaming during register setting
+    sensor_write(i2cdev, address, &data);		
+	 msleep(10);
+	 
+	    address[0]=0x30;
+        address[1]=0x37;
+    sensor_read(i2cdev, address, &data); //Rootdivider
+	if (data & 0x10) // if Rootdivider==2;
+	{
+		if (Rootdivider==1)
+		{
+		data &= 0xEF;
+		sensor_write(i2cdev, address, &data); //clear Rootdivider
+		}
+	}
+	else
+	{
+		if (Rootdivider==2)
+		{
+		data |= 0x10;
+		sensor_write(i2cdev, address, &data); //set Rootdivider
+		}
+	}
+	
+
+        address[0]=0x30;
+        address[1]=0x37;
+    sensor_read(i2cdev, address, &data);
+    data &= 0xf0;
+	data |= Predivider;
+	sensor_write(i2cdev, address, &data); 
+	
+       address[0]=0x30;
+        address[1]=0x36;
+    sensor_write(i2cdev, address, &Multiplier); //Multiplier. (4-127, 128-252=only even)
+
+	
+	
+	    address[0]=0x30;
+        address[1]=0x08;
+		data=0x02; //poweron at end. start sensor streaming
+    sensor_write(i2cdev, address, &data);		
+	
+csi_debug(2,"set FPS:%u pclk:%lu VCO:%lu Multipl:%u Prediv:%u Rootdiv:%u Sysdiv:%lu \n",fps,pclk,VCO,Multiplier,Predivider,Rootdivider,SYSdivider);
+	
+	
+	} // endif not nightmode
+}  //endif fps		
+else
+/*    
+csi_debug(2,"Predivider = %u,Multiplier = %u,Rootdivider = %u,SystemClockDivider = %u,BITdivider = %u,PCLKdivider = %u\n",\
+Predivider,Multiplier,Rootdivider,SystemClockDivider,BITdivider,PCLKdivider);
+*/			   
+csi_debug(2,"+++Pxclk: %lu VCO:%lu Multipl:%u Prediv:%u Rootdiv:%u Sysdiv:%lu \n",pclk,VCO,Multiplier,Predivider,Rootdivider,SYSdivider);
 
     info->pxclk = pclk;
     return pclk;
 }
 
 /** calc fps
+extralines cannot be set , its overwritten by the camera to 0.
+extending VTS works with maxvalue 0x7fff giving less than 1 fps.
 
+FPS depends on: 
+- Pixelclock
+- HTS and VTS (picturesize)
+    fps = pclk / ((vts_extra+vts) * hts);
+	(vts_extra+vts)=pclk/fps*hts
 
 exit: 0=error, else fps
 */
@@ -1236,7 +1555,7 @@ static int calc_fps(struct v4l2_subdev *sd)
 //---------------- get timing for fps
         address[0]=0x35;
 
-// get AEC VTS value if set.		
+// get AEC VTS value if set.		not apply!
         address[1]=0x0C;
     sensor_read(i2cdev, address, &data);
 	vts_extra = data<<8;
@@ -1253,6 +1572,7 @@ static int calc_fps(struct v4l2_subdev *sd)
     sensor_read(i2cdev, address, &data);
     hts |= data;
  	
+	
        address[1]=0x0E;
     sensor_read(i2cdev, address, &data); //number of lines  VTS
     vts = data<<8;
@@ -1330,7 +1650,7 @@ static int calc_fps(struct v4l2_subdev *sd)
 
     if((hts&&(vts+vts_extra)) == 0)
         return 0;
-    pclk=get_pclk(sd);
+    pclk=get_pclk(sd,0);
      if (!pclk) 
 	 {
 	 csi_debug(2,"calc pclk failed\n");
@@ -1338,10 +1658,14 @@ static int calc_fps(struct v4l2_subdev *sd)
 	 }
 
     fps = pclk / ((vts_extra+vts) * hts);
-   info->fps=fps;
-csi_debug(2,"IspWidth:%u IspHeight:%u PoutWidht:%u PoutHeight:%u Outwidth;%u OutHeight:%u\n",ispwidth, ispheight,preoutwidth, preoutheight, outwidth, outheight);
+	offset=pclk*10 / ((vts_extra+vts) * hts);
+	info->hts=hts;
+	info->vts=vts;
+   info->fps=fps; //set current fps settings
+   info->pxclk=pclk;
+csi_debug(2,"+++FPS:IspWidth:%u IspHeight:%u PoutWidht:%u PoutHeight:%u Outwidth;%u OutHeight:%u\n",ispwidth, ispheight,preoutwidth, preoutheight, outwidth, outheight);
 csi_debug(2,"------------>HTS:%u VTS:%u EXTRA:%u\n",hts,vts,vts_extra);
-    csi_debug(2,"***Framerate: FPS: %u Pixelclock:%lu\n",fps, pclk);
+    csi_debug(2,"***Framerate: FPS: %u Fps10:%u Pixelclock:%lu\n",fps, offset, pclk);
 
     return fps;
 }
@@ -1350,8 +1674,8 @@ csi_debug(2,"------------>HTS:%u VTS:%u EXTRA:%u\n",hts,vts,vts_extra);
 
 
 /*
-max gain =248, min gain = 16
-max exposure = 980, min exposure= 2..measured 
+max gain =998, min gain = 16
+max exposure = 15744, min exposure= 2..measured 
 
 settings info:
 agc aec: exposure(3500-02), gain(350a-b),luminance(56a1),extra(350c-d),aec(3503),agc,ashigh(3a0f),aslow(3a10),achigh(3a1b),aclow(3a1e)
@@ -1485,7 +1809,7 @@ address[1]=0x87;
 sensor_read(i2cdev, address, &data);
 yend|=data;
 
-csi_debug(3,"- avlumwinON:%u xstart:%u xend:%u ystart:%u yend:%u\n",aw,xstart,xend,ystart,yend);
+csi_debug(3,"- avglumwinON:%u xstart:%u xend:%u ystart:%u yend:%u\n",aw,xstart,xend,ystart,yend);
 
 address[0]=0x3a;
 address[1]=0x00;
@@ -1600,7 +1924,7 @@ address[1]=0x21;
 sensor_read(i2cdev, address, &data);
 if (data&0x01) binon=1; // horizontal binning on?
 
-csi_debug(3,"- subsampon:%u (2=2x2) binnOn:%u  valh:0x%02x valv:0x%02x\n",subsampon, binon, subh,subv);
+csi_debug(3,"- subsampon:%u (2=2x2) binOn:%u  valh:0x%02x valv:0x%02x\n",subsampon, binon, subh,subv);
 }
 
 
@@ -1610,7 +1934,7 @@ precondition:  scaling is on, subsample is off
 set output window size by using down-scaling from the whole physical sensor. full view
 isp input window is set to max.
 if aspect-ratio is 4:3 then just downsclaing is used.
-if aspect is not 4:3, x or y sip offset is set to desired aspect ratio. then its downscaled from there.
+if aspect is not 4:3, x or y isp offset is set to desired aspect ratio. then its downscaled from there.
 no-we just downscale without aspect correction
 
 We must use max HTS VTS because we need to read the full sensor.
@@ -1635,10 +1959,11 @@ hts = 2844;
 vts = 1968;
 
 
+
 if ( (outwidth > ispx) || (outheight > ispy) || (outwidth < 40) || (outheight < 40) ) return 1; // error
 
 
-// just skip aspect ratio, we may so have distorted pictures, thats fine.
+// just skip aspect ratio, we may so have distorted/streched pictures, thats fine.
 /*
 lval = 0;
 // see if dividable by 4. we need aspect ratio 4:3
@@ -1665,6 +1990,12 @@ if (lval > ispx) return 2; // invalid proportion
 yoffset += (ispx - lval)/2; // just change yoffset to fit output aspect ratio for isp
 }
 */
+// ispx correction
+ispx -=1; // must be odd for first window
+ispx += 32; // add standard offset 2 * 16
+// ispy correction
+ispy -=1; // must be odd for first window
+ispy += 8; // add standard offset 2 * 4
 
 address[0]=0x38;
 // set isp window full frame/ full view of camera
@@ -1677,10 +2008,10 @@ data = 0;
 sensor_write(i2cdev, address, &data);	
 //isp x-end
 address[1]=0x04;
-data = (ispx-1)>>8;
+data = ispx>>8;
 sensor_write(i2cdev, address, &data);
 address[1]=0x05;
-data = (ispx-1); //(0 to n-1!)
+data = ispx; //(0 to n-1!)
 sensor_write(i2cdev, address, &data);	
 
 //isp y-start
@@ -1692,14 +2023,14 @@ data = 0;
 sensor_write(i2cdev, address, &data);	
 //isp y-end
 address[1]=0x06;
-data = (ispy-1)>>8;
+data = ispy>>8;
 sensor_write(i2cdev, address, &data);
 address[1]=0x07;
-data = (ispy-1); //(0 to n-1!)
+data = ispy; //(0 to n-1!)
 sensor_write(i2cdev, address, &data);	
 
 // set isp offset--not changed as we do just scale without aspect correction
-
+// the isp offset is the position of top/left of output window.
 //out x-offset
 address[1]=0x10;
 data = xoffset>>8;
@@ -1730,6 +2061,7 @@ address[1]=0x0b;
 data = outheight;
 sensor_write(i2cdev, address, &data);	
 
+
 // timing: HTS VTS to full.  pxclk per line, number of lines
 address[1]=0x0c;
 data = hts>>8;
@@ -1745,11 +2077,16 @@ address[1]=0x0f;
 data = vts;
 sensor_write(i2cdev, address, &data);	
 
+
+
 // subsample off	
 address[1]=0x14;
-data = 0x11;
+data = 0x11; // 0x11=off. 0x31 = on
 sensor_write(i2cdev, address, &data);
 address[1]=0x15;
+sensor_write(i2cdev, address, &data);	
+address[1]=0x21;
+data=0x00; // binning on =0x01, off=0x00
 sensor_write(i2cdev, address, &data);	
 
 // SDE on(7), scale on(5), UV average off(2), CMX on(1), AWB on(0)
@@ -1761,74 +2098,85 @@ sensor_write(i2cdev, address, &data);
 return 0;
 }
 
+
 /*
-This function changes the area of the sensor to be scanned in. The View.
-The size that is scanned in equals the given output window size.
-This is also called crobbing or better zooming, as the chosen section looks enlarged, its the section of the full resolution.
+This function creates a crobbed window of the full sensorimage as to wanted output size.
+It zooms towards the center of the original picture.
+This is done by changing the ISP input size using registers 0 to 7.
+The smaller the wanted windowsize, the faster fps can be achived.
 
-The ISP is fed with the selection section of the picture.
-This selection can be done by either changing the ISP-input window (select any area in the picture)
-or changing the ISP offset (zooming into the center of the picture/above ISP-input window),
-or both.
+The timing is optimized to achive the fastest possible framerate.
 
-As the scanned sensor area is smaller, we can change the Timing VTS HTS to have faster FPS.
-
-precondition:
-HTS VTS at max..to be tested: depends on ISP input size!
-scaling off
-subsample off
-
-HTS: number of picturepixels + 32 dummypixel (16 in front and 16 an the end)
-VTS: number of picturelines + 20 dummy lines (14 in front and 6 at the end)
+scaling is off
+subsample is off
 
 Framerate HTS * VTS / pxclk: determines exposure and shutter.
-1896 * 984 (1,92)= 15 fps  (640 x 480) with subsample of full picture
-2844 * 1968 (1,44)= 5 fps  (2592 x 1944) no subsample
+1896 * 984 (1,92)= 15 fps
+2844 * 1968 (1,44)= 5 fps
 
 entry: 
-- ispwidth,ispheight	size of isp-input window (must be >= outwindow). We current cannot give an origin offset to this window (where in the original)
-						if either value is 0, then a seperate ISP-input window is not created and just the ISP offset is used, which works the same.(tbtested)
-						This window enters into the ISP and influences the FPS.
-						The TestBarImage is generated inside the ISP, so this actually gets full size on this setting.(the picture doesnt)
-- outwidth,outheight 	size of output window. The desired window size. This Subwindow is in the ISP-Input window.
+
+- outwidth,outheight 	size of output window. The desired window size. This Subwindow is the ISP-Input window.
 						if either value is 0, output window is set to max resolution!!!
 						This window is the Output of the ISP and does not influence FPS!
-
-Will set ISP input window.
-Then set offset to difference isp to output.
+All values must be divide by 4!						
 
 exit:_ 0=success, else error
 */
-int zoom_image(unsigned int ispwidth, unsigned int ispheight, unsigned int outwidth, unsigned int outheight)
+int zoom_image(unsigned int outwidth, unsigned int outheight)
 {
 unsigned char address[REG_ADDR_STEP], data;
-unsigned int ispx, ispy, outx, outy, maxx, maxy;
-maxx = 2592; // max ISP input size
+unsigned int ispx, ispy, outx, outy, maxx, maxy,hts,vts;
+maxx = 2592; // max ISP input size = max active sensor area
 maxy = 1944;
+hts = 2844; // max sensor area including dark pixels.
+vts = 1968;
 address[0]=0x38;
 
-if (!ispwidth || !ispheight || !outwidth || !outheight) //if special settings
-{
-	if (!ispwidth || !ispheight) // no isp window
-	{
-		ispwidth = maxx;
-		ispheight = maxy;
-	}
+// check for  values divby 4
+
+if ( (outwidth%4)||(outheight%4) ) return 1; //error
+
+
 	
-	if (!outwidth || !outheight)
+	if (!outwidth || !outheight) // max window
 	{
-		ispwidth = outwidth =maxx;
-		ispheight = outheight = maxy;
+		outwidth = maxx;
+		outheight = maxy;
 	}
-}
+
 
 if ( (outwidth > maxx) || (outheight > maxy) ) return 1; // error
-if ( (outwidth > ispwidth) || (outheight > ispheight) || (ispwidth > maxx) || (ispheight > maxy) ) return 1; // error
 
-ispx = (maxx - ispwidth)/2; //x-start of scanning, can be 0!
-ispy = (maxy - ispheight)/2; //y-start of scanning
 
-// set isp window -------------------------
+/* calc hts and vts for fastest FPS:
+*/
+if ((outwidth < maxx)||(outheight < maxy)) // if output size is smaller than biggest possible
+{
+//set HTS:
+ispx = outwidth + 252; //minimum HREF offtime is 252
+while (ispx%4) ispx++; // advance hts until dividable by 4
+// known working hts values: 1422, 1896, 2133, 2844
+if (ispx < 1422) //experiment shows, values under 1422 do not work, because of analog sensor readout timing as limitation
+ispx=1422; // min limit.
+if (ispx < hts) // max limit
+hts = ispx;
+// else take maxvalue set above
+
+//set VTS:
+ispy = outheight + (20232/hts) + 1;  //20232 = vsync predelay(5688)+vsync postdelay(14544). see datasheet
+while (ispy%4) ispy++; // advance vts until dividable by 4
+if (ispy < vts) 
+vts = ispy;
+// else take maxvalue set above
+
+}
+
+
+ispx = (maxx - outwidth)/2; //x-start of scanning, can be 0! /2 because either side.
+ispy = (maxy - outheight)/2; //y-start of scanning
+
+// set isp input window, this influences FPS range: 0 to n-1, so odd endsizes allways -------------------------
 //isp x-start
 address[1]=0x00;
 data = ispx>>8;
@@ -1837,7 +2185,7 @@ address[1]=0x01;
 data = ispx;
 sensor_write(i2cdev, address, &data);	
 //isp x-end
-ispx += ispwidth-1; //(0 to n-1!)
+ispx += outwidth-1; //(0 to n-1!)
 address[1]=0x04;
 data = ispx>>8;
 sensor_write(i2cdev, address, &data);
@@ -1853,27 +2201,27 @@ address[1]=0x03;
 data = ispy;
 sensor_write(i2cdev, address, &data);	
 //isp y-end
-ispy += ispheight-1; //(0 to n-1!)
+ispy += outheight-1; //(0 to n-1!)
 address[1]=0x06;
 data = ispy>>8;
 sensor_write(i2cdev, address, &data);
 address[1]=0x07;
-data = ispy;
+data = ispy; 
 sensor_write(i2cdev, address, &data);	
 
-// set output window -------------------------
-outx = (ispwidth - outwidth)/2; //x-offset
-outy = (ispheight - outheight)/2; // y-offset
+// set output window offsets-------------------------we do not use default values as 16 and 4! and use 0 offset!
+outx = 0;
+outy = 0;
 
-// isp offset:
-//out x-offset
+
+//set internal isp-offset, x-offset
 address[1]=0x10;
 data = outx>>8;
 sensor_write(i2cdev, address, &data);
 address[1]=0x11;
 data = outx;
 sensor_write(i2cdev, address, &data);	
-//out y-offset
+// y-offset
 address[1]=0x12;
 data = outy>>8;
 sensor_write(i2cdev, address, &data);
@@ -1896,6 +2244,20 @@ address[1]=0x0b;
 data = outheight;
 sensor_write(i2cdev, address, &data);	
 
+// set HTS and VTS
+address[1]=0x0c;
+data = hts>>8;
+sensor_write(i2cdev, address, &data);
+address[1]=0x0d;
+data = hts;
+sensor_write(i2cdev, address, &data);
+address[1]=0x0e;
+data = vts>>8;
+sensor_write(i2cdev, address, &data);
+address[1]=0x0f;
+data = vts;
+sensor_write(i2cdev, address, &data);
+
 // subsample off	
 address[1]=0x14;
 data = 0x11;
@@ -1903,15 +2265,16 @@ sensor_write(i2cdev, address, &data);
 address[1]=0x15;
 sensor_write(i2cdev, address, &data);	
 // scale off
-// SDE on(7), scale off(5), UV average off(2), CMX on(1), AWB on(0)
+// SDE on(7), scale off(5), UV average off(2), CMX on(1), AWB on(0): 
 address[0]=0x50;
 address[1]=0x01;
 data = 0x83;
 sensor_write(i2cdev, address, &data);
 
-
+//auto_exposure();
 return 0;
 }
+
 
 
 
@@ -1930,38 +2293,35 @@ struct v4l2_control
 */
 static int sensor_g_ctrl(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
 {
-    unsigned char data;
+    struct sensor_info *info = to_state(sd);
+	unsigned char data=0;
 
     csi_debug(2,"get control called:%u--\n",ctrl->id);
 
     switch (ctrl->id)
     {
-    case V4L2_CID_COLORFX: // test pattern
-        data = control.pattern;
-        break;
-
-    case V4L2_CID_EXPOSURE: //exposure modes
-        data = control.autoexp;
-        break;
-
-    case V4L2_CID_AUTOGAIN: // autogain on/off
-        data = control.autogain;
-        break;
-
     case V4L2_CID_VFLIP:
-        data = control.vflip;
+        data = info->vflip;
         break;
 
     case V4L2_CID_HFLIP:
-        data = control.hflip;
+        data = info->hflip;
         break;
 
+	case V4L2_CID_COLORFX: // color effects: missused as test pattern selection
+        data = info->pattern;
+        break;
 
     case V4L2_CID_GAIN:
-        data = control.gain;
+		data = info->gain;
+        break;
+
+	case V4L2_CID_EXPOSURE: // nightmode on/off
+        data = info->autoexp;
         break;
 
     default:
+    csi_debug(2,"get, control not supported");	
         return -EINVAL;
     }
     ctrl->value=data;
@@ -1979,18 +2339,38 @@ single register settings are done here without need of register list.
 */
 static int sensor_s_ctrl(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
 {
+    struct sensor_info *info = to_state(sd);
     unsigned char address[REG_ADDR_STEP];
     unsigned char data = 0;
     int ret=0;
 
     csi_debug(2,"set control called:%u--%u \n",ctrl->id, ctrl->value);
 
-    data = ctrl->value;
     switch (ctrl->id)
     {
-    case V4L2_CID_COLORFX: //testpattern output, 4 modes
+    case V4L2_CID_VFLIP: // picture flip
+        info->vflip = ctrl->value;
+        address[0]=0x38;
+        address[1]=0x20;
+        ret+=sensor_read(i2cdev, address, &data);
+        if (ctrl->value) data |= 0x06; //sensor vflip
+        else data &= ~0x06;
+        ret+=sensor_write(i2cdev, address, &data);
+        break;
+
+    case V4L2_CID_HFLIP:
+        info->hflip = ctrl->value;
+        address[0]=0x38;
+        address[1]=0x21;
+        ret+=sensor_read(i2cdev, address, &data);
+        if (ctrl->value) data |= 0x06; //sensor hflip/mirror
+        else data &= ~0x06;
+        ret+=sensor_write(i2cdev, address, &data);
+        break;
+
+	case V4L2_CID_COLORFX: //color effects,missused as testpattern output, 4 modes
         data = ctrl->value;
-        control.pattern = data;
+        info->pattern = data;
         if (data)
         {
             data -= 1;
@@ -1998,53 +2378,29 @@ static int sensor_s_ctrl(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
         }
         address[0]=0x50;
         address[1]=0x3D;
-        ret=sensor_write(i2cdev, address, &data);
+        ret+=sensor_write(i2cdev, address, &data);
         break;
 
-    case V4L2_CID_EXPOSURE: //exposure modes, tbd..
-        data = ctrl->value;
-        control.autoexp = data;
+
+    case V4L2_CID_GAIN:  //manual gain adjust to SDE(special digital effects in isp)
+        info->gain = ctrl->value;
+        address[0]=0x55;
+        address[1]=0x86;
+        data=ctrl->value;
+        ret+=sensor_write(i2cdev, address, &data);
+		
         break;
 
-    case V4L2_CID_AUTOGAIN: // nightmode on/off
-        control.autogain = ctrl->value;
+	case V4L2_CID_EXPOSURE: // nightmode on/off
+		info->autoexp=ctrl->value;
         address[0]=0x3A;
         address[1]=0x00;
-        ret=sensor_read(i2cdev, address, &data);
+        ret+=sensor_read(i2cdev, address, &data);
         if (ctrl->value) data |= 0x04;
         else data &= ~0x04;
         ret+=sensor_write(i2cdev, address, &data);
         break;
-
-    case V4L2_CID_VFLIP: // picture flip
-        control.vflip = ctrl->value;
-        address[0]=0x38;
-        address[1]=0x20;
-        ret=sensor_read(i2cdev, address, &data);
-        if (ctrl->value) data |= 0x02;
-        else data &= ~0x02;
-        ret+=sensor_write(i2cdev, address, &data);
-        break;
-
-    case V4L2_CID_HFLIP:
-        control.hflip = ctrl->value;
-        address[0]=0x38;
-        address[1]=0x21;
-        ret=sensor_read(i2cdev, address, &data);
-        if (ctrl->value) data |= 0x02;
-        else data &= ~0x02;
-        ret+=sensor_write(i2cdev, address, &data);
-        break;
-
-
-    case V4L2_CID_GAIN:  //manual gain adjust
-        control.gain = ctrl->value;
-        address[0]=0x55; //y gain for contrast
-        address[1]=0x86;
-        data=ctrl->value;
-        ret=sensor_write(i2cdev, address, &data);
-        break;
-
+		
     default:
         return -EINVAL;
     }
@@ -2054,29 +2410,23 @@ static int sensor_s_ctrl(struct v4l2_subdev *sd, struct v4l2_control *ctrl)
 }
 
 /** query the avalability of a control and if supported,
+This is where controls are created in the app.
+
 fill in min, max, step and default value for these controls.
 see include/linux/videodev2.h for details
 
 EINVAL if control not supported.
 
+Docu on supported controls: (relates to:  sensor_queryctrl, sensor_g_ctrl, sensor_s_ctrl)
+
 For the ov5640, the following controls are supported:
-Horizontal flip: 0x3821 Bit1: 1=on; 0=off; preread value
-Vertical flip:   0x3820 Bit1: 1=on; 0=off; preread value
 
-contrast,  is done by enabling digital effects:
-0x5001 byte_value: 0=off (no adjustment possible) 0x01=on adjustment possible.(***digital effects, default=1)
-if on:
-brightness: 0x5587 byte_value: 0 - 255, 127=middle  (***Y-bright)
-contrast:   0x5586 byte_value: 0 - 255, 127=middle (***Y-gain)  works!
-saturation: not yet done
+Horizontal flip binary switch(V4L2_CID_HFLIP): 0x3821 Bit0: 1=on; 0=off; preread value
+Vertical flip binary switch(V4L2_CID_VFLIP):   0x3820 Bit0: 1=on; 0=off; preread value
 
+exposure,automatic (V4L2_CID_EXPOSURE): binary switch 0-1: 0x3a00 enable nightmode, SelectRange: 0(off) to 1(on).
 
-night_mode: supports long exposure times depend on light, changes frame rate.(***nightmode,default=0)
-night_mode: 0x3A00 bit2: 1=on; 0=off preread value
-
-auto_gain is used for enable/disable digital effects. set contrast, brightness, saturation.
-auto_exposure is used to enable/disable night mode. check this ?????????????????????
-
+Color Effects (V4L2_CID_COLORFX): Number select 0-4:  missused as testpattern select
 Testpattern:
 mode 0 = test pattern off. ie. normal picture!
 mode 1 = eight color bar
@@ -2084,18 +2434,13 @@ mode 2 = gradual change at vertical
 mode 3 = gradual change at horizontal
 mode 4 = gradual change at vertical and horizontal
 
-automatic exposure options :  tbd...
-- LAEC = quick lightchange response bit-6
-- auto Banding(Flicker) bit 5
-- less 1 band = quick change flicker bit 4
-- nightmode  bit2
-0x3A00:
-default: 0x78
 
- ***autogain AGC:
- 0x3503 bit 1  = manual gain enable manual
- 0x350A = gain hibyte (only bits 0-1)  so its a 10 bit value.
- 0x350B = gain low byte
+
+Gain(V4L2_CID_GAIN): Slider(0 - 128) 
+y-bright: 0x5587 byte_value: 0 - 255, 32 defalut  (***Y-bright)  SDE digital effects
+alternative: y-gain  0x5586
+
+
 
 To init the range of the control  v4l2_ctrl_query_fill is used:
 v4l2_ctrl_query_fill(pointer to struct, min_val, max_val, stepsize, default)
@@ -2103,91 +2448,87 @@ v4l2_ctrl_query_fill(pointer to struct, min_val, max_val, stepsize, default)
 static int sensor_queryctrl(struct v4l2_subdev *sd,
                             struct v4l2_queryctrl *qc)
 {
-    csi_debug(2,"query-control called--\n");
+   csi_debug(2,"query-control called--\n");
     switch (qc->id)
     {
-    case V4L2_CID_COLORFX: // test pattern
-        v4l2_ctrl_query_fill(qc, 0, 4, 1, 0);
-        qc->type = V4L2_CTRL_TYPE_INTEGER;
-        return 0;
-
-    case V4L2_CID_EXPOSURE: //exposure modes
-        v4l2_ctrl_query_fill(qc, 0, 4, 1, 1);
-        qc->type = V4L2_CTRL_TYPE_INTEGER;
-        return 0;
-    case V4L2_CID_AUTOGAIN:   // autogain on/off
-        v4l2_ctrl_query_fill(qc, 0, 1, 1, 1);
-        qc->type = V4L2_CTRL_TYPE_INTEGER;
-        return 0;
-
+	case V4L2_CID_EXPOSURE: // switch nightmode on/off default:off
     case V4L2_CID_VFLIP:
     case V4L2_CID_HFLIP:
-        v4l2_ctrl_query_fill(qc, 0, 1, 1, 0);
+        v4l2_ctrl_query_fill(qc, 0, 1, 1, 0); //default: 0
         qc->type = V4L2_CTRL_TYPE_BOOLEAN;
         return 0;
+//    case V4L2_CID_EXPOSURE_AUTO: //exposure values, not used
+//	case V4L2_CID_AUTOBRIGHTNESS: //not used yet. see autogain
+//	break;
+	
+    case V4L2_CID_COLORFX: // test pattern select
+        v4l2_ctrl_query_fill(qc, 0, 4, 1, 0); //default: 0
+        qc->type = V4L2_CTRL_TYPE_INTEGER;
+        return 0;
 
-    case V4L2_CID_GAIN:
-        v4l2_ctrl_query_fill(qc, 0, 128, 1, 64);
+    case V4L2_CID_GAIN: // manual gain, if autogain is off
+        v4l2_ctrl_query_fill(qc, 0, 128, 1, 32);
         qc->flags = V4L2_CTRL_FLAG_SLIDER;
         return 0;
 
     default:
-        break;
+	break;
     }
-    csi_debug(2,"--unknown control--\n");
+    csi_debug(2,"query, --unknown control:%u--\n",qc->id);
     return -EINVAL;
 }
 
 
-/** get framerate
+/** get framerate of currently set format/windowsize
 
-The Camera does not support a fixed frame rate.
-Framerate depends on the windowsize and pixelclock and colorformat and exposure.
-So...ni specific Framerate !!!
-We tell, that we are using 30 fps frames per second.
+return current active framerate
+
+
 */
 static int sensor_g_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *parms)
 {
     struct v4l2_captureparm *cp = &parms->parm.capture;
     struct sensor_info *info = to_state(sd);
-csi_debug(2,"g_parm called\n");
+    csi_debug(2,"g_parm:-");
+
     if (parms->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-        return -EINVAL;
+        return -1;
 
     memset(cp, 0, sizeof(struct v4l2_captureparm));
     cp->capability = V4L2_CAP_TIMEPERFRAME;
-	// time per frame = 1 / fps  = numerator / denominator.
-    cp->timeperframe.numerator = 1;  // zähler. 
+    cp->timeperframe.numerator = 1;
 
-    if (info->width > 800 && info->height > 600)
-    {
-        cp->timeperframe.denominator = 15; //nenner
-    }
-    else
-    {
-        cp->timeperframe.denominator = 30;
-    }
+        cp->timeperframe.denominator = info->fps; //current fps
+csi_debug(2,"%u\n",info->fps);
 
     return 0;
 }
 
-/** set framerate, we not support
+/** set working framerate
+
+set desired framerate.
+
 */
 static int sensor_s_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *parms)
 {
-csi_debug(2,"s_parm called\n"); 
-/*
     struct v4l2_captureparm *cp = &parms->parm.capture;
-    if (parms->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-        return -EINVAL;
-    memset(cp, 0, sizeof(struct v4l2_captureparm));
-    cp->capability = V4L2_CAP_TIMEPERFRAME;
-	// time per frame = 1 / fps  = numerator / denominator.
-    cp->timeperframe.numerator = 1;  // zähler. 
-    cp->timeperframe.denominator = 30;
+    struct sensor_info *info = to_state(sd);
+    csi_debug(2,"s_parm:%u\n",cp->timeperframe.denominator);
+
+    if ((cp->timeperframe.denominator < info->min_fps)|| (cp->timeperframe.denominator > info->max_fps)) return -1;
+	//fps::-ERANGE
+	if (cp->timeperframe.denominator == info->fps) return(0); // allready set!
+	
+	if (!get_pclk(sd,cp->timeperframe.denominator)) 
+	{
+	    csi_debug(2,"s_parm - set fps failed\n");
+
+	return -1;
+	}
+	
+	calc_fps(sd); // update info
+	
 	return 0;
-*/
-    return -EINVAL;
 }
 
 
@@ -2198,7 +2539,15 @@ csi_debug(2,"s_parm called\n");
 // +++:++++++++++++++++++++  v4l2_subdev_video_ops sensor_video_ops  ***************************
 
 
-// this has exta pointers for the found entrys in format and size table.
+/** Find best fit for wanted colorformat and windowsize.
+fmt=contains all info
+ppformat=address of colorformat pointer we will set here if nonzero
+ppsize = address of windowsize pointer we set here if nonzero
+
+we use fmt->reserved[0] to store the fps of the found entry, the driver knows!
+-
+all info is returned in fmt
+ */
 static int sensor_try_fmt_internal(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *fmt, struct sensor_format_struct **ppformat,
                                    struct sensor_win_size **ppsize)
 {
@@ -2206,7 +2555,7 @@ static int sensor_try_fmt_internal(struct v4l2_subdev *sd, struct v4l2_mbus_fram
     int index;
     struct sensor_win_size *psize;
 
-    // try to find the wanted format in our format table
+    // try to find the wanted color format in our format table
     for (index = 0; index < ARRAY_SIZE(sensor_formats); index++)
         if (sensor_formats[index].fourcc == fmt->code)
             break;
@@ -2218,12 +2567,12 @@ static int sensor_try_fmt_internal(struct v4l2_subdev *sd, struct v4l2_mbus_fram
     }
 
 
-    // we take the window size, that is smaller or equal to the wanted one.
+    // lookup the wanted windowsize: we take the window size, that is smaller or equal to the wanted one.
     for (psize = sensor_win_sizes; psize < sensor_win_sizes + (ARRAY_SIZE(sensor_win_sizes)); psize++)
         if (fmt->width >= psize->width && fmt->height >= psize->height)
             break;
 
-    // if no match found, take the smallest one
+    // if no match found, take the smallest one, the last
     if (psize >= sensor_win_sizes + (ARRAY_SIZE(sensor_win_sizes)))
         psize--;
 
@@ -2239,6 +2588,9 @@ static int sensor_try_fmt_internal(struct v4l2_subdev *sd, struct v4l2_mbus_fram
     fmt->height = psize->height;
     fmt->code = sensor_formats[index].fourcc;
     fmt->field = sensor_formats[index].bitsperpixel;  //missuse field as bpp!
+	fmt->reserved[0] = psize->min_fps;
+	fmt->reserved[1] = psize->def_fps;
+	fmt->reserved[2] = psize->max_fps;
     return 0;
 }
 
@@ -2250,8 +2602,7 @@ Caller tells us the wanted index. He wants the fourcc-code and a description.
 We get the  index and address of u32 code.
 We go into the format table and copy the fourcc to *code.
 */
-static int sensor_enum_fmt(struct v4l2_subdev *sd, unsigned index,
-                           enum v4l2_mbus_pixelcode *code)
+static int sensor_enum_fmt(struct v4l2_subdev *sd, unsigned index, enum v4l2_mbus_pixelcode *code)
 {
 
     if (index >= ARRAY_SIZE(sensor_formats))
@@ -2260,6 +2611,78 @@ static int sensor_enum_fmt(struct v4l2_subdev *sd, unsigned index,
     *code = sensor_formats[index].fourcc;
     return 0;
 }
+
+/** v4l2_subdev_video_ops - sensor_enum_framesizes
+struct v4l2_frmsizeenum *fsize:
+u32 index given by caller
+u32 pixel_format given by caller
+u32 type
+union-struct v4l2_frmsize_discrete...to be filled here
+u32 width
+u32 height
+
+We forgot to check the colorformat, but hey.
+*/
+static int sensor_enum_framesizes(struct v4l2_subdev *sd, struct v4l2_frmsizeenum *fsize)
+{
+
+    struct sensor_win_size *psize;
+    csi_debug(2,"enum_framesizes:%u\n",fsize->index);
+
+if ((fsize == NULL)||(fsize->index >= ARRAY_SIZE(sensor_win_sizes) )) return -1; //ARRAY_SIZE=number of entrys
+fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+psize = &sensor_win_sizes[fsize->index];
+	fsize->discrete.width = psize->width;
+	fsize->discrete.height = psize->height;
+    csi_debug(2,"-return:%u %u",psize->width,psize->height);	
+    return 0;
+}
+
+
+/** v4l2_subdev_video_ops - sensor_enum_frameintervals
+get fps settings for a given windowsize.
+
+struct v4l2_frmivalenum *fival:
+u32 index = index of wanted entry in enumeration in the fps array given by caller. we only have one = 0!
+u32 pixel_format given by caller. we dont use this
+u32 width = windowsize width of wanted fps array, set by caller
+u32 height = windowsize height of wanted fps array, set by caller
+u32 type = type of framerate. we set this to discrete
+u32 discrete.numerator = zaehler...to be filled here from the relevant windowsize etry
+u32 discrete.denomiator = nenner...to be filled here.zB: 1/5fps = 0,2 seconds frame interval
+*/
+static int sensor_enum_frameintervals(struct v4l2_subdev *sd, struct v4l2_frmivalenum *fival)
+{
+	int ret;
+	struct v4l2_mbus_framefmt fmt; //.width = width,.height = hight,.code = fourcc
+
+    csi_debug(2,"enum_frameintervals index:%u %u %u\n",fival->index,fival->width,fival->height);
+	
+if ((fival == NULL)) return -1; 
+
+
+fmt.code = fival->pixel_format;
+fmt.width = fival->width;
+fmt.height = fival->height;
+sensor_try_fmt_internal(sd, &fmt, NULL, NULL); // we always find something, maybe not the wanted one.
+
+ret=0;
+//check if we found a match, so we have the correct fps
+if (fmt.code != fival->pixel_format) ret++;
+if (fmt.width != fival->width) ret++;
+if (fmt.height != fival->height) ret++;
+if (fival->index > 2) ret++;
+if (ret) return -1;
+
+// ok,return the relevant fps
+fival->type = V4L2_FRMIVAL_TYPE_DISCRETE; //V4L2_FRMIVAL_TYPE_CONTINUOUS;V4L2_FRMIVAL_TYPE_STEPWISE; V4L2_FRMIVAL_TYPE_DISCRETE
+
+fival->discrete.numerator = 1;
+fival->discrete.denominator = fmt.reserved[fival->index];
+
+    return 0;
+}
+
 
 
 /**
@@ -2300,8 +2723,9 @@ static int sensor_s_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *fmt)
     struct sensor_format_struct *pformat;
     struct sensor_win_size *psize;
     struct csi_camera *pcam=(struct csi_camera *)dev_get_drvdata(sd->v4l2_dev->dev);
-
-    csi_debug(1,"sensor_s_fmt\n");
+	struct sensor_info *info = to_state(sd);
+	
+    csi_debug(2,"sensor_s_fmt\n");
 
     // we call try-fmt again here(user should have done that before), just to make sure!, also we get the pointers we need.
     ret = sensor_try_fmt_internal(sd, fmt, &pformat, &psize);
@@ -2331,15 +2755,21 @@ static int sensor_s_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *fmt)
     pcam->csi_mode.input_fmt = pformat->csi_input;
     pcam->csi_mode.output_fmt = pformat->csi_output;
     pcam->csi_mode.seq = pformat->byte_order;
-
+	
+	// update information in info struct
+	info->width=psize->width;
+	info->height = psize->height;
+	info->min_fps = psize->min_fps;
+	info->def_fps = psize->def_fps;
+	info->max_fps = psize->max_fps;
+	
     // update the information to be returned
     fmt->width = psize->width;
     fmt->height = psize->height;
     fmt->code = pformat->fourcc;
     fmt->field = pformat->bitsperpixel; //missusing field as bpp!
-
     msleep(100);
-	calc_fps(sd);
+	calc_fps(sd); //sets info->fps, info->pxclk
 
     return 0;
 }
@@ -2364,6 +2794,7 @@ static int sensor_g_chip_ident(struct v4l2_subdev *sd,
 
 
 /** v4l2_subdev_core_ops
+hardware reset the camera sensor.
 */
 static int sensor_reset(struct v4l2_subdev *sd, u32 val)
 {
@@ -2434,22 +2865,24 @@ static int sensor_detect(struct v4l2_subdev *sd)
 
 
 /** v4l2_subdev_core_ops - camera_init
-called when camera is opened, after poweron.
+called when camera is opened, after poweron.csi_open
 */
 static int camera_init(struct v4l2_subdev *sd, u32 val)
 {
     int ret;
-    csi_debug(2,"camera init called--check ID\n");
+    csi_debug(2,"camera init called (open)--check ID\n");
 
     /*Make sure it is a target sensor*/
     ret = sensor_detect(sd);
     if (ret)
     {
-        csi_debug(3,"chip found is not an target chip.\n");
+        csi_debug(3,"chip found is not the target chip.\n");
         return ret;
     }
 // here we init the camera with all values needed for all formats. format specific stuff is transfered on top of this.
-   return sensor_write_array(sd, sensor_init_regs , ARRAY_SIZE(sensor_init_regs));
+   sensor_write_array(sd, regs_init_VGA , ARRAY_SIZE(regs_init_VGA));
+   calc_fps(sd);
+   return(0);
 }
 
 
@@ -2473,6 +2906,7 @@ static int sensor_power(struct v4l2_subdev *sd, int on)
     struct csi_camera *pcam=(struct csi_camera *)dev_get_drvdata(sd->v4l2_dev->dev);
     struct sensor_info *info = to_state(sd);
     char csi_stby_str[32],csi_power_str[32],csi_reset_str[32];
+	unsigned char address[REG_ADDR_STEP],data;
 
     csi_debug(2,"sensor power called--\n");
 
@@ -2492,17 +2926,25 @@ static int sensor_power(struct v4l2_subdev *sd, int on)
     switch(on)
     {
     case CSI_SUBDEV_STBY_ON:
-        csi_debug(1,"CSI_SUBDEV_STBY_ON\n");
+        csi_debug(2,"CSI_SUBDEV_STBY_ON\n");
 //       gpio_write_one_pin_value(pcam->csi_pin_hd,CSI_STBY_ON,csi_stby_str); // in \linux-sunxi-lemaker-3.4\arch\arm\plat-sunxi/sys_config.c
-        msleep(10);
+	    address[0]=0x30;
+        address[1]=0x08;
+		data=0x42; //stop streaming , software powerdwon
+    sensor_write(i2cdev, address, &data);		
+	 msleep(10);
         break;
     case CSI_SUBDEV_STBY_OFF:
-        csi_debug(1,"CSI_SUBDEV_STBY_OFF\n");
+        csi_debug(2,"CSI_SUBDEV_STBY_OFF\n");
 //       gpio_write_one_pin_value(pcam->csi_pin_hd,CSI_STBY_OFF,csi_stby_str); // no i2c possible if standby!!. so we leave it on.
+	    address[0]=0x30;
+        address[1]=0x08;
+		data=0x02; //poweron at end. start sensor streaming
+    sensor_write(i2cdev, address, &data);		
         msleep(10);
         break;
     case CSI_SUBDEV_PWR_ON:
-        csi_debug(1,"CSI_SUBDEV_PWR_ON\n");
+        csi_debug(2,"CSI_SUBDEV_PWR_ON\n");
 //activate output pins for reset and standby
         gpio_set_one_pin_io_status(pcam->csi_pin_hd,1,csi_stby_str);//set the gpio to output
         gpio_set_one_pin_io_status(pcam->csi_pin_hd,1,csi_reset_str);//set the gpio to output
@@ -2515,7 +2957,7 @@ static int sensor_power(struct v4l2_subdev *sd, int on)
         msleep(10);
         if(pcam->dvdd)
         {
-            regulator_enable(pcam->dvdd);
+            regulator_enable(pcam->dvdd);  // in: ...\include\linux\regulator\consumer.h
             msleep(10);
         }
         if(pcam->avdd)
@@ -2538,7 +2980,7 @@ static int sensor_power(struct v4l2_subdev *sd, int on)
         break;
 
     case CSI_SUBDEV_PWR_OFF:
-        csi_debug(1,"CSI_SUBDEV_PWR_OFF\n");
+        csi_debug(2,"CSI_SUBDEV_PWR_OFF, close\n");
 		
 		showinfo();		// show last used settings for debug
 		
@@ -2576,6 +3018,8 @@ static int sensor_power(struct v4l2_subdev *sd, int on)
 
 
 /** v4l2_subdev_core_ops - sensor_ioctl
+each camera has different requirements for clock and signal polarity.
+get/set cameras  port settings, so the csi driver can properly set its signals to the camera modul.
 */
 static long sensor_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 {
@@ -2676,7 +3120,9 @@ subdevice video operations:
 */
 static const struct v4l2_subdev_video_ops sensor_video_ops =
 {
-    .enum_mbus_fmt = sensor_enum_fmt,
+    .enum_mbus_fmt = sensor_enum_fmt,  // color format
+	.enum_framesizes = sensor_enum_framesizes, // window size
+	.enum_frameintervals = sensor_enum_frameintervals, // fps
     .try_mbus_fmt = sensor_try_fmt,
     .s_mbus_fmt = sensor_s_fmt,
     .s_parm = sensor_s_parm,
@@ -2701,31 +3147,19 @@ static int sensor_probe(struct i2c_client *client, const struct i2c_device_id *i
 //	int ret;
     csi_debug(2,"Subdev Driver Probe\n");
 
-    info = kzalloc(sizeof(struct sensor_info), GFP_KERNEL);
+    info = kzalloc(sizeof(struct sensor_info), GFP_KERNEL); //zeros the allocation!
     if (info == NULL)
         return -ENOMEM;
 
     sd = &info->sd;
     // open i2c interface and get a handle to it(sd).
     v4l2_i2c_subdev_init(sd, client, &sensor_ops);
-    i2cdev = sd; //save i2c device handle .tomk
+    i2cdev = sd; //save global i2c device handle .tomk
+	
     // set default values:
+    info->fmt = &sensor_formats[0]; // the first format
+    info->csi_sig_cfg = &ccm_info_con;  //camera port signal settings
 
-    info->fmt = &sensor_formats[0];
-    info->csi_sig_cfg = &ccm_info_con;
-
-    info->brightness = 0;
-    info->contrast = 0;
-    info->saturation = 0;
-    info->hue = 0;
-    info->hflip = 0;
-    info->vflip = 0;
-    info->gain = 0;
-    info->autogain = 1;
-    info->exp = 0;
-    info->autoexp = 0;
-    info->autowb = 1;
-    info->wb = 0;
 // framerate stuff
 	info->fps=0;
 	info->pxclk=0;
@@ -2786,10 +3220,10 @@ module_exit(subdev_exit);
 
 /* pll settings:	input clock(XVCLK)=24MHZ from CSI. (camera XVCLK input range= 6 - 27 MHZ)
 Block diagram:
-                                                                                      >MIPIdivider->mipi clock
+                                                                                      >Sysclk->MIPIdivider->mipi clock
                                                                                       |
 XVCLK->Predivider->Phase detector->Loop filter(chargepump)->VCO->System clock divider-> Rootdivider->BITdivider->PCLKdivider->PCLK
-                  |                                             |
+                  |                                             |                     
                   <--Frequency Divider(Multiplier)<-------------< 500-1000Mhz
 
 PLL Block explain:
@@ -2839,15 +3273,15 @@ Thats it ! and it works!
 // PLL Settings:
 //    {{0x30,0x39},{0x80}}, //bypass pll, gives only 1 fps!
     {{0x30,0x34},{0x1a}},//(6-4)=charge pump loop filter. (3-0)=BITdivider. 1a=10bit(default), 18=8bit(a bit faster!)
-    {{0x30,0x35},{0x21}},//(7-4)=SystemClockDivider. (3-0)=MIPIdivider(must stay at 1!). default=0x11
+    {{0x30,0x35},{0x21}},//(7-4)=SystemClockDivider(Post Pll). (3-0)=MIPIdivider(must stay at 1!). default=0x11
     {{0x30,0x36},{0x46}},//(7-0)=Multipiler. default=0x69.  0x46->30fps
-    {{0x30,0x37},{0x13}},//(4)=Rootdivider. (3-0)=Predivider.  default=0x03.
+    {{0x30,0x37},{0x13}},//(4)=Rootdivider. (3-0)=Predivider (Pre Pll).  default=0x03.
 
 	{{0x31,0x08},{0x16}}, //(5-4)=PCLKdivider;(3-2)=sclk2x root divider; (1-0)=SCLK root divider; default:0x16.
 	
 Video Timing in Pixelclocks:
 5Mpixel: 2592 * 1944
-Vsync-periodendauer = 	5596692 = one complete frame, depends on number of lines.ie. height
+Vsync-periodendauer = 	5596692 pxclks = one complete frame, depends on number of lines.ie. height
 HREF-periodendauer = 2844 (HTS) min.HREF-Pulsdauer + ?2
 HREF-Pulsdauer = 2592 (output linelength) ie. width = valid pixeldata
 
@@ -2917,10 +3351,19 @@ Alltogether 3 modes of sensor picturesize change(output size/data conversion)  a
 - windowing = crobbing, cut out a subarea of the physical sensor for output (zoom)
 - scaling = full image downscale. digital scaler downsamples the whole image for smaler output.
 
+The ov5640 Sensor Array:	
+Physical Size = 2624 columns * 1964 rows. 
+The first 14 and last 6 lines are dummy. The first 16 columns and last 16 columns per line are also dummy.
+So active pixel that can be outputted: 2592 * 1944. 
+The documentation seems inconsistent as default values assume the following:
+2624 columns * 1952 rows including dummys.
+2624 -(16+16)=2592 active columns
+1952 -(4+4) = 1944 active rows.
+
 +++ relevant registers in 4 groups:
-+ 1: define ISP input size ie. FieldOfView FOV (Subwindow to be scanned from sensor) : 
-	 The FOV can be anywhere on the sensorarray!
-    The ISP input size defines the total pixel data actually read from sensor pixel array! 
++ 1: ANALOG CROB: define ANALOG WINDOW  (ISP input) size ie. FieldOfView FOV (Subwindow to be scanned from sensor) : 
+	 The FOV can be anywhere on the sensorarray! addressed pixel-array region!
+    The analog window size defines the total pixel data actually read from sensor pixel array! 
     This area is fed into the image sensor processor ISP. the smaller the faster FPS possible (see Timing +3)!
     {{0x38,0x00},{0x00}},             //sensor window x-start = 0  (default 0) 
     {{0x38,0x01},{0x00}},             //
@@ -2929,9 +3372,9 @@ Alltogether 3 modes of sensor picturesize change(output size/data conversion)  a
     {{0x38,0x04},{0x0a}},             //sensor window x-end  = a3f=2623    (default 2623) offset in (0 to n-1)
     {{0x38,0x05},{0x3f}},             //
     {{0x38,0x06},{0x07}},             //sensor window y-end = 79f = 1951   (default 1951) offset in (0 to n-1)
-    {{0x38,0x07},{0x9f}},             //subwindow = 2623 * 1951 = 2624*1952
+    {{0x38,0x07},{0x9f}},             //subwindow = 2623 * 1951 = 2624*1952 with dummys
 
-+ 2: define the DVP output picture size that is transmitted out on the parallel port:
++ 2: OUTPUT SIZE: define the DVP output picture size that is transmitted out on the parallel port:
 	It actually tells the DVP how long the HREF Pulse is on. = DVPHO pixelclocks.
 	It also tells the DVP, how many HREF Pulses it shall issue = DVPVO lines.
 	It thus defines the size of the outputted image.
@@ -2943,22 +3386,22 @@ Alltogether 3 modes of sensor picturesize change(output size/data conversion)  a
     {{0x38,0x0a},{0x01}},            //output height from y-start =  1e0 = 480   DVPVO (default 1944)
     {{0x38,0x0b},{0xe0}},
 
-+ 3: This defines the Video Timing, Linetime in Pixelclocks, Frametime in Lines. HREF-period, VSYNC Period.
++ 3: TIMING: This defines the Video Timing, Linetime in Pixelclocks, Frametime in Lines. HREF-period, VSYNC Period.
 	It includes non-visible pixels at start/end of sensor and dummy-lines, and blanking. values should be dividable by 4.
 	It must not be less than the ISP Inputwindow! or if binning, half of it. i guess?
 	 It also controls exposure and sensor readout logic. Its actually used by the ISC to generate HREF and VSYNC.
-	Values: ov5640 sensor array = 2624 coloms * 1964 rows. active pixel that can be outputted: 2592 * 1944. minxy-offset=32/8!
 	(caution: the CSI interface can only handle 4096 Bytes, thus for yuv422 thats 2048!maybe?)
-    {{0x38,0x0c},{0x07}},             //total width = 768 = 1896   HTS (default 2844)  Horizontal total size for 1 line = HREF Period
-    {{0x38,0x0d},{0x68}},             //
-    {{0x38,0x0e},{0x03}},             //total height = 3d8 = 984   VTS (default 1968)  Vertical total size for 1 frame. VTS*HTS = VSYNC Period
-    {{0x38,0x0f},{0xd8}},             //
+    {{0x38,0x0c},{0x07}}, //total width = 768 = 1896   HTS (default 2844)  Horizontal total size for 1 line = HREF Period
+    {{0x38,0x0d},{0x68}}, //
+    {{0x38,0x0e},{0x03}}, //total height = 3d8 = 984   VTS (default 1968)  Vertical total size for 1 frame. VTS*HTS = VSYNC Period
+    {{0x38,0x0f},{0xd8}}, //
 
-+ 4: This defines a Subwindow in the ISP Inputwindow.  It defines the size of the output-window if no scaling is used. ie. it crops.
++ 4: DIGITAL CROB: This defines a Subwindow in the ISP Inputwindow.  It defines the size of the output-window if no scaling is used. ie. it crops.
 	 If scaling is used, this Subwindow is used to be downscaled to the outputsize as defined in +2.
 	 So we have actually 2 methods of "cropping" the physical sensor: +1  and +4. where only +1 will have effect on Framerate!
-	 The offsets are applied to the beginning and end of the ISP Window to result in an always centered window.
+	 The offsets are applied to the beginning and end of the ISP Window to result in an always centered window asto +1.
 	 Therefore the offset values must be divided by 2.
+	 effetively this commonly is used to remove the dummy lines and rows, or adjusting aspect ratio!
     {{0x38,0x10},{0x00}},             //isp x-offset = 10 = 16  H offset(default 16) default min offset = valid array size
     {{0x38,0x11},{0x10}},              //
     {{0x38,0x12},{0x00}},              //isp y-offset = 4 = 4   V offset(default 4)
@@ -2976,19 +3419,38 @@ VTS must be dividable by 4!?
 HSYNC period = HTS*VTS   hsync defines the exposure as it is the time a row can gather light.
 
 
-+++subsample and binning:
-subsample means, scipping pixel horizontal, and skipping lines vertical. Thus reducing image datasize while keeping FOV.
++++subsample and binning: (analog function)
+subsample means, scipping pixel horizontal, and skipping lines vertical. 
+Thus reducing image datasize while keeping same FOV.
 binning means, averaging the lightlevels of adjacent pixel (the ones that are skipped by subsample) into the subsample destination.
-Thus considering also the skipped pixels.
+Thus considering also the skipped pixels,giving brigter picture.
 
-A typical subsample with binning of 2x2 will result in halfing the imagesize.
+Binning only possible in subsample modes:  2x2, 1x2, and 2x1 
+
+A typical subsample with binning of 2x2 (hor=2,vert=2) will result in halfing the imagesize.
+
+Subsample Formular: subsamplefactor= (odd_inc + even_inc) / 2
+The even increment must always be set to 1.
+example 2x2: 
+hor_odd_inc=3,hor_even_inc=1 then hor_subsamplefactor = (3+1)2=2
+vert_odd_inc=3,Vert_even_inc=1 then vert_subsamplefactor = (3+1)/2=2
+
+The Timing (HTS VTS) can then be adjusted to:
+HTS= (2844(default) / hor_odd_inc) * hor_subsamplefactor
+VTS= 1968(default) / vert_subsamplefactor
+
+subsamplefactors more than 2 dont really work.
+VERY IMPORTANT!!! 
+- on subsample, always obey the 4:3 aspect ratio, otherwise you get artifacts.
+- subsample just reduces datasize, the rest is the same.ie. scale will scale down the image, else you only get ISP-size.
+
 
 This all happends in the analog sensor readout logic.
 
 Section +1 and +4 define the field of view.
 Section +3 and +4 should assume the halfed datasize of image, in active binning.
-on the other hand, as binning is in the analog section, the ISP input data is actually half of +1. Then +4 would apply to
-the reduced framedata?
+on the other hand, as binning is in the analog section, the ISP input data is actually half of +1. 
+Then +4 would apply to the reduced framedata?
 
 subsample/binning registers:
 0x3814 = horizontal even/odd increment 0x31 for 2x2
@@ -3021,7 +3483,7 @@ defining the average window for YAVG, the picture average luminance value in 0x5
 0x5682 - 03 = 11bit Y-start Vertical start position for average window
 0x5686 - 87 = 11bit Y-end
 
-gain:
+gain(analog gain):
 automatic gain control will only activate if aec control reaches its limit. Value is autoset in autoagc!
 0x350a-0b = 10bit current analog gain value (auto set in auto agc). maximum gain is 64. range:0-1023. so div 16 gives real gain.
 0x3A18-19 = 10bit AGC ceiling/max value
@@ -3030,7 +3492,7 @@ automatic gain control will only activate if aec control reaches its limit. Valu
 0x3A00[2] = nightmode enable(1)
 0x3A05[6] =  insert frame enable(1). increase and decrease step based on frames(1) or lines/bands(0).off=longer exposure!
 0x3A05[5] =  exposure step auto(1) or manual(0). step auto-ratio can be set in bits 0-4
-0x3A17[1:0]   Gain night threshold = gain value when in nightmode
+0x3A17[1:0]   Gain night threshold = gain value when nightmode gets activated
 night mode ceiling:(max exposure when nightmode is used)
 0x3A02-03 = nightmode ceiling or 16bit max_exposure60hz. default: 15744
             Only this register must be set to define the maximum wanted exposure in nightmode!!!
@@ -3053,8 +3515,10 @@ In all resolutions we provide auto aec, auto agc, auto 50/60hz detection, possib
 
 - When night mode is turned on, dummy lines is inserted automatically and the frame rate is decreased.
 - nightmode can be left on. does not harm capture during normal light conditions. ie. is not active then.
+	however..i observed, if in nightmode and sudden lightchange, streaming may stop, dont know why.
 
 //+++jpeg capture:
-It seems jpeg capture is not supported by the A20 CSI interface.
+It seems jpeg capture is not supported by the A20 CSI interface because of variable size length of transmited data.
+..Tomk 2017
 
 ------------------------------------------------*/

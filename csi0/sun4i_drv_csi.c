@@ -1,4 +1,4 @@
-/*
+/* https://github.com/xenpac/Camera-CSI-Driver-Linux-Sunxi.git
  * drivers/media/video/sun4i_csi/csi0/sun4i_drv_csi.c
  *
  * (C) Copyright 2007-2012
@@ -126,7 +126,6 @@ Note: CSI Fifos capture one complete Line at a time! Then DMA to memory during h
 #define CSI_RELEASE 0
 #define CSI_VERSION \
 	KERNEL_VERSION(CSI_MAJOR_VERSION, CSI_MINOR_VERSION, CSI_RELEASE)
-#define CSI_MODULE_NAME "sun4i_csi"
 
 //#define AJUST_DRAM_PRIORITY
 #define REGS_pBASE					(0x01C00000)	 	      // register base addr
@@ -766,6 +765,7 @@ static struct videobuf_queue_ops csi_video_qops =
 /**@brief query capabilities
 The ioctl takes a pointer to a struct v4l2_capability which is filled by the driver. 
 When the driver is not compatible with this specification the ioctl returns an EINVAL error code.
+
 */
 static int vidioc_querycap(struct file *file, void  *priv,
                            struct v4l2_capability *cap)
@@ -773,7 +773,7 @@ static int vidioc_querycap(struct file *file, void  *priv,
     struct csi_camera *pcam = priv;
     csi_debug(2,"ioctl - vidioc_querycap=sun4i_csi\n");
     strcpy(cap->driver, "sun4i_csi");
-    strcpy(cap->card, "sun4i_csi");
+    strcpy(cap->card, pcam->cam_name); //mod this to include the camera name!!!tomk
     strlcpy(cap->bus_info, pcam->v4l2_dev.name, sizeof(cap->bus_info));
 
     cap->version = CSI_VERSION;
@@ -2150,7 +2150,11 @@ csi_debug(2,"v4l2_device_registered\n");
             csi_debug(3,"***ERROR:Error when get camera info use default!\n");
         }
 
+#ifdef CSIPORT0
         pcam->csi_sig_cfg.csi_port = 0; // set this drivers csi port
+#else
+        pcam->csi_sig_cfg.csi_port = 1; // set this drivers csi port
+#endif
 		// update cameras port settings
         ret = v4l2_subdev_call(pcam->psubdev,core,ioctl,CSI_SUBDEV_CMD_SET_INFO,&pcam->csi_sig_cfg); 
         if (ret < 0)

@@ -122,7 +122,12 @@ void bsp_csi_capture_get_status(struct csi_camera *pcam,struct csi_capture_statu
     status->video_in_progress   = (t>>1)&0x1;
 }
 
-/* size */
+/* set window size 
+length_h = number of pixelclocks per line, 
+length_v = number of lines = height
+buf_length_h = fifo length, the max of the three fifos in planar mode, or the bytesperline
+
+*/
 void bsp_csi_set_size(struct csi_camera *pcam, u32 length_h, u32 length_v, u32 buf_length_h)
 {
     /* make sure yuv422 input 2 byte(clock) output 1 pixel */
