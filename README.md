@@ -1,4 +1,4 @@
-# OV5640-Sunxi-A20
+ # OV5640-Sunxi-A20
 
 This is a replacement driver for the existing Linux Sunxi CSI Camera Driver.
 
